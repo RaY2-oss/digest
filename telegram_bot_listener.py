@@ -93,11 +93,10 @@ def handle_update(update):
     """Регистрирует отправителя и обрабатывает одну команду из апдейта.
     /rundigest  — запускает обработку в фоновом потоке (не блокирует polling).
     /resetlock  — снимает LOCK_PATH вручную (на случай, если предыдущий
-                  запуск завис и не снял лок сам); доступно только
-                  пользователям из config.ALLOWED_TG_USER_IDS."""
+                  запуск завис и не снял лок сам).
+    Обе команды доступны всем пользователям бота."""
     message = update.get("message", {})
     text = message.get("text", "")
-    user_id = message.get("from", {}).get("id")
     chat_id = message.get("chat", {}).get("id")
 
     if chat_id is not None:
@@ -107,16 +106,9 @@ def handle_update(update):
         return
 
     if text.startswith("/rundigest"):
-        if user_id not in config.ALLOWED_TG_USER_IDS:
-            send_message(chat_id, "⛔ У вас нет прав для этой команды.")
-            log.warning("Отклонён /rundigest от неавторизованного user_id=%s (chat_id=%s)", user_id, chat_id)
-            return
         threading.Thread(target=run_processor, args=(chat_id,), daemon=True).start()
 
     elif text.startswith("/resetlock"):
-        if user_id not in config.ALLOWED_TG_USER_IDS:
-            send_message(chat_id, "\u26d4 У вас нет прав для этой команды.")
-            return
         if os.path.exists(LOCK_PATH):
             os.remove(LOCK_PATH)
             send_message(chat_id, "\U0001f513 Блокировка снята.")
