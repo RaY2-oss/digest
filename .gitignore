@@ -1,0 +1,18 @@
+# --- secrets (NEVER commit) ---
+.env
+
+# --- python ---
+__pycache__/
+*.py[cod]
+venv/
+.cache/
+
+# --- runtime data & generated artifacts ---
+data/
+logs/
+output/
+users.json
+
+# --- lock/temp files ---
+*.lock
+*.week_tmp
