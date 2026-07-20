@@ -42,12 +42,14 @@ _load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 PROXIES = None  # прямой доступ, WARP недоступен из AlexHost
 
 # ---------------------------------------------------------------------------
-# Пути проекта (абсолютные, чтобы cron работал корректно)
+# Пути проекта. Вычисляются от расположения этого файла, поэтому остаются
+# абсолютными (нужно для cron), но не привязаны к /opt/digest — проект можно
+# развернуть в любом каталоге.
 # ---------------------------------------------------------------------------
-BASE_DIR = "/opt/digest"
-DB_PATH = "/opt/digest/data/digest.db"
-OUTPUT_DIR = "/opt/digest/output"
-LOG_DIR = "/opt/digest/logs"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "data", "digest.db")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
 
 # ---------------------------------------------------------------------------
 # Модель эмбеддингов (скачается автоматически в ~/.cache/huggingface/ при
