@@ -16,6 +16,7 @@ _call_openrouter_raw(): она принимает system-промпт и user-с
 """
 
 import logging
+import os
 import time
 
 import requests
@@ -33,7 +34,14 @@ CLASSIFY_TIMEOUT = 45         # таймаут одного вызова chat/co
 POOL_SIZE = 5                 # сколько ":free"-моделей держим в пуле одновременно
 BETWEEN_MODEL_PAUSE = 10      # пауза перед сменой модели при 429/5xx, сек
 
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Переопределяется через .env (config._load_dotenv отработал при import config выше),
+# чтобы пустить вызовы через headroom на 127.0.0.1:8787. Дефолт — прямой OpenRouter,
+# поэтому без записи в .env поведение не меняется.
+# Список моделей (MODELS_URL) намеренно остаётся прямым: это не chat/completions,
+# сжимать там нечего, а лишний хоп ломал бы обновление пула при падении прокси.
+OPENROUTER_API_URL = os.environ.get(
+    "OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions"
+)
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 # Используются, если запрос списка моделей у OpenRouter не удался.

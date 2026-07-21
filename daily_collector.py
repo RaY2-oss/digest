@@ -101,7 +101,10 @@ def _run_mode_label() -> str:
 # OpenRouter: общий пул ":free"-моделей для LLM-фильтров ниже
 # (тематическая релевантность + региональная классификация).
 # ---------------------------------------------------------------------------
-_OR_API = "https://openrouter.ai/api/v1/chat/completions"
+# Переопределяется через .env — см. комментарий в model_rotation.py.
+_OR_API = os.environ.get(
+    "OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions"
+)
 _OR_MODELS = "https://openrouter.ai/api/v1/models"
 _FB_MODELS = ["google/gemma-3-27b-it:free", "meta-llama/llama-3.1-8b-instruct:free"]
 _POOL_SIZE = 5
