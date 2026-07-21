@@ -60,6 +60,19 @@ GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 # нечего — в отличие от OpenRouter, где это делает суффикс ":free".
 FALLBACK_POOL_SIZE = 5
 
+# Чёрный список заведомо слабых моделей: если id содержит один из этих
+# (регистронезависимых) фрагментов — в пул не берём. Слабая модель = плохая
+# грамматика/куцые заголовки, лучше пропустить провайдера, чем отгрузить брак.
+# У API нет сигнала "качества", поэтому фильтр по имени тира. Правь под себя.
+# ponytail: подстрочный блок-лист — грубо; если пул зачистится в ноль, провайдер
+# просто пропустится (кольцо уйдёт к следующему).
+WEAK_MODEL_BLOCKLIST = ("lite", "-8b", "8b-", "-4b", "-3b", "-1b", "-mini", "-small", "nano")
+
+
+def _is_weak(mid: str) -> bool:
+    low = mid.lower()
+    return any(bad in low for bad in WEAK_MODEL_BLOCKLIST)
+
 # None = список ещё не тянули; [] = тянули, пусто/ошибка (повторно не дёргаем).
 _groq_pool = None
 _google_pool = None
@@ -336,6 +349,8 @@ def _groq_models():
             # у Groq в списке ещё аудио/модерация — не для чата
             if any(x in mid for x in ("whisper", "tts", "guard")):
                 continue
+            if _is_weak(mid):
+                continue
             chat.append((m.get("context_window") or 0, mid))
         # ponytail: "лучшая" == наибольший контекст — грубая эвристика, без сигнала
         # качества из API; ротация всё равно перебирает пул при сбое.
@@ -367,6 +382,8 @@ def _google_models():
             mid = m.get("name", "").split("/", 1)[-1]
             # только текстовые gemini-* (отсекает lyria/robotics/embedding/imagen…)
             if not mid.startswith("gemini-") or "robotics" in mid:
+                continue
+            if _is_weak(mid):
                 continue
             ctx = m.get("inputTokenLimit") or 0
             # tie-break при равном контексте: стабильные -latest вперёд, preview назад

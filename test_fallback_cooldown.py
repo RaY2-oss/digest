@@ -39,6 +39,19 @@ def test_openrouter_cooldown_skips_pool():
     assert calls["or"] == 1, f"OpenRouter дёрнут повторно в кулдауне: {calls}"
 
 
+def test_weak_blocklist():
+    """Блок-лист режет слабые тиры, но не задевает сильные (регрессия: 'mini' в 'gemini')."""
+    weak = ["gemini-flash-lite-latest", "llama-3.1-8b-instant", "gpt-4o-mini", "gemma-3-1b"]
+    strong = ["gemini-pro-latest", "gemini-flash-latest", "llama-3.3-70b-versatile",
+              "openai/gpt-oss-120b", "gemini-2.5-pro"]
+    for w in weak:
+        assert m._is_weak(w), f"должен блокироваться: {w}"
+    for s in strong:
+        assert not m._is_weak(s), f"НЕ должен блокироваться: {s}"
+
+
 if __name__ == "__main__":
     test_openrouter_cooldown_skips_pool()
     print("OK: circuit-breaker пропускает исчерпанный OpenRouter")
+    test_weak_blocklist()
+    print("OK: блок-лист слабых моделей (и 'gemini' не ложно-срабатывает)")
