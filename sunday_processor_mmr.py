@@ -537,6 +537,13 @@ def _validate_summary_fast(result: dict) -> tuple[bool, str]:
     if not title or not summary:
         return False, "пустой title или summary"
 
+    # Заголовок-обрубок: слабая модель иногда выдаёт только префикс-локацию
+    # ("В Турции", "В Казахстане:") без сути новости. Требуем минимум 3 значимых
+    # слова — иначе перевыбор модели/статьи (ловим и пустые "В стране" заголовки).
+    title_words = [w for w in re.findall(r"\w+", title, re.UNICODE) if len(w) > 1]
+    if len(title_words) < 3:
+        return False, f"заголовок-обрубок: «{title}»"
+
     cyr   = len(re.findall(r"[а-яёА-ЯЁ]", full))
     alpha = len(re.findall(r"[a-zA-Zа-яёА-ЯЁ]", full))
     if alpha > 0 and cyr / alpha < _MIN_CYRILLIC_RATIO:

@@ -146,7 +146,7 @@ def _init_models_pool(force_refresh=False):
 # ---------------------------------------------------------------------------
 # Публичная функция: один LLM-запрос с ротацией моделей при сбоях
 # ---------------------------------------------------------------------------
-def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "") -> str | None:
+def _openrouter_attempt(system_prompt: str, user_message: str, ref_url: str = "") -> str | None:
     """
     Отправляет (system_prompt, user_message) очередной модели из пула.
     При 429/5xx или сетевой ошибке пессимизирует модель (сдвигает в конец
@@ -154,11 +154,6 @@ def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "
     Возвращает текст ответа модели или None, если весь пул провалился.
     """
     global _free_models_pool, _batches_processed
-
-    if _in_cooldown("OpenRouter"):
-        # OpenRouter уже признан исчерпанным в этом прогоне — не тратим ~50с на
-        # заведомо мёртвый :free-пул, сразу к фолбэкам.
-        return _finish_with_fallbacks(system_prompt, user_message, ref_url)
 
     force = _batches_processed > 0 and _batches_processed % POOL_REFRESH_INTERVAL == 0
     _init_models_pool(force_refresh=force)
@@ -233,16 +228,50 @@ def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "
             )
             time.sleep(BETWEEN_MODEL_PAUSE)
 
-    _mark_dead("OpenRouter")  # весь :free-пул провалился в этом вызове
-    return _finish_with_fallbacks(system_prompt, user_message, ref_url)
+    return None  # весь :free-пул провалился; кольцо решит, что дальше
 
 
-def _finish_with_fallbacks(system_prompt: str, user_message: str, ref_url: str) -> str | None:
-    fb = _call_fallbacks(system_prompt, user_message)
-    if fb is not None:
-        log.info("Фолбэк-провайдер отдал ответ для %s", ref_url)
-        return fb
-    log.error("_call_openrouter_raw: все модели и фолбэки провалились для %s", ref_url)
+# ---------------------------------------------------------------------------
+# Публичная функция: один LLM-запрос с round-robin по провайдерам.
+# Провайдеры образуют кольцо OpenRouter -> Groq -> Google -> (снова OpenRouter).
+# Стартовая точка вращается между вызовами, поэтому нагрузка размазывается по
+# всем трём (суммарной суточной квоты хватает дольше), а исчерпанный провайдер
+# пропускается по кулдауну. За один вызов делаем не более одного круга.
+# ---------------------------------------------------------------------------
+_PROVIDERS = ["OpenRouter", "Groq", "Google"]
+_rr_start = 0
+
+
+def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "") -> str | None:
+    global _rr_start
+    n = len(_PROVIDERS)
+    for i in range(n):
+        tag = _PROVIDERS[(_rr_start + i) % n]
+        if _in_cooldown(tag):
+            continue
+        out = _provider_call(tag, system_prompt, user_message, ref_url)
+        if out is not None:
+            _rr_start = (_rr_start + i + 1) % n  # следующий вызов — со следующего провайдера
+            log.info("%s отдал ответ для %s", tag, ref_url)
+            return out
+        _mark_dead(tag)  # весь пул провайдера провалился
+    log.error("_call_openrouter_raw: все провайдеры исчерпаны для %s", ref_url)
+    return None
+
+
+def _provider_call(tag: str, system_prompt: str, user_message: str, ref_url: str) -> str | None:
+    if tag == "OpenRouter":
+        return _openrouter_attempt(system_prompt, user_message, ref_url)
+    if tag == "Groq":
+        if not config.GROQ_API_KEY:
+            return None
+        return _try_pool(_groq_models(), GROQ_API_URL, config.GROQ_API_KEY,
+                         system_prompt, user_message, "Groq")
+    if tag == "Google":
+        if not config.GOOGLE_API_KEY:
+            return None
+        return _try_pool(_google_models(), GOOGLE_API_URL, config.GOOGLE_API_KEY,
+                         system_prompt, user_message, "Google")
     return None
 
 
@@ -350,17 +379,3 @@ def _google_models():
     return _google_pool
 
 
-def _call_fallbacks(system_prompt: str, user_message: str) -> str | None:
-    """Groq -> Google, каждый со своей ротацией моделей. None если оба молчат."""
-    providers = [
-        (config.GROQ_API_KEY,   _groq_models,   GROQ_API_URL,   "Groq"),
-        (config.GOOGLE_API_KEY, _google_models, GOOGLE_API_URL, "Google"),
-    ]
-    for key, models_fn, url, tag in providers:
-        if not key or _in_cooldown(tag):
-            continue
-        out = _try_pool(models_fn(), url, key, system_prompt, user_message, tag)
-        if out is not None:
-            return out
-        _mark_dead(tag)  # весь пул провайдера молчит
-    return None
