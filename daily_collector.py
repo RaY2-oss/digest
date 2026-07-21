@@ -106,7 +106,6 @@ _OR_API = os.environ.get(
     "OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
 _OR_MODELS = "https://openrouter.ai/api/v1/models"
-_FB_MODELS = ["google/gemma-3-27b-it:free", "meta-llama/llama-3.1-8b-instruct:free"]
 _POOL_SIZE = 5
 
 
@@ -114,7 +113,8 @@ def _build_pool(existing, force=False):
     """
     Возвращает список ":free"-моделей OpenRouter (топ-_POOL_SIZE по context_length).
     Если existing уже заполнен и force=False — возвращает его как есть (не дёргает API).
-    При ошибке запроса — фолбэк на _FB_MODELS (или на existing, если он был).
+    При ошибке запроса возвращает existing, т.е. возможно пустой список —
+    захардкоженного фолбэка нет намеренно, см. комментарий в model_rotation.py.
     """
     if existing and not force:
         return existing
@@ -136,7 +136,7 @@ def _build_pool(existing, force=False):
         return pool
     except Exception as exc:
         log.warning("Pool refresh failed: %s", exc)
-        return existing or list(_FB_MODELS)
+        return existing
 
 
 def _fmodel_call(mid, prompt, system_prompt):
@@ -182,7 +182,11 @@ def _run_batches_parallel(chunks, pool, call_fn, empty_result_fn):
         return []
     results = [None] * len(chunks)
     if not pool:
-        pool = list(_FB_MODELS)
+        # Пустой пул уронил бы ThreadPoolExecutor(max_workers=0). Отдаём то же,
+        # что и при отказе всех моделей на батч: фильтр -> False (fail-closed),
+        # регион -> MIX.
+        log.warning("Пул моделей пуст — %d батч(ей) уходят в дефолт", len(chunks))
+        return [empty_result_fn(chunk) for chunk in chunks]
 
     with ThreadPoolExecutor(max_workers=min(len(chunks), len(pool))) as ex:
         futures = {}

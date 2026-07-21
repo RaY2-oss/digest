@@ -44,11 +44,12 @@ OPENROUTER_API_URL = os.environ.get(
 )
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
-# Используются, если запрос списка моделей у OpenRouter не удался.
-FALLBACK_MODELS = [
-    "google/gemma-3-27b-it:free",
-    "meta-llama/llama-3.1-8b-instruct:free",
-]
+# Захардкоженного списка моделей нет намеренно: ":free"-модели у OpenRouter
+# регулярно уезжают в платные (gemma-3-27b-it стала отдавать 404 "use the paid
+# slug"), и зашитый фолбэк тихо гниёт — выглядит как страховка, а на деле
+# гарантированно проваливает вызовы. Не собрали пул — возвращаем None, весь
+# вызывающий код это уже умеет.
+_pool_refresh_failed = False
 
 
 # ---------------------------------------------------------------------------
@@ -58,11 +59,18 @@ def _init_models_pool(force_refresh=False):
     """
     Тянет список моделей с OpenRouter, оставляет только ":free",
     сортирует по context_length по убыванию и берёт топ-POOL_SIZE.
-    При ошибке запроса откатывается на FALLBACK_MODELS.
+    При ошибке запроса пул остаётся пустым.
     """
-    global _free_models_pool
+    global _free_models_pool, _pool_refresh_failed
 
     if _free_models_pool and not force_refresh:
+        return
+
+    if _pool_refresh_failed:
+        # Список уже не отдался в этом процессе. Без раннего выхода мы дёргали бы
+        # /models на каждом из ~20+ вызовов подряд, по CLASSIFY_TIMEOUT (45 с)
+        # на попытку — прогон висел бы четверть часа, чтобы всё равно вернуть
+        # None. Следующий запуск cron стартует новый процесс и попробует снова.
         return
 
     try:
@@ -89,10 +97,12 @@ def _init_models_pool(force_refresh=False):
         if not _free_models_pool:
             raise ValueError("Список ':free' моделей пуст")
 
+        _pool_refresh_failed = False
         log.info("Пул моделей обновлён: %s", _free_models_pool)
     except Exception as exc:  # noqa: BLE001
-        log.warning("Не удалось получить список моделей (%s). Fallback.", exc)
-        _free_models_pool = list(FALLBACK_MODELS)
+        log.warning("Не удалось получить список моделей (%s). Пул пуст.", exc)
+        _free_models_pool = []
+        _pool_refresh_failed = True
 
 
 # ---------------------------------------------------------------------------
