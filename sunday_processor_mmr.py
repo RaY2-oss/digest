@@ -498,8 +498,11 @@ def _validate_topic_pre_llm(text: str, url: str, bucket: str) -> tuple[bool, str
     raw    = _call_openrouter_raw(system, user_msg, ref_url=url)
     parsed = _parse_llm_json(raw)
     if parsed is None:
-        log.warning("_validate_topic_pre_llm: не удалось распарсить ответ для %s | raw=%r", url, str(raw)[:200])
-        return False, "не удалось распарсить ответ LLM"
+        # Парс-фейл (LLM недоступна / вернула не-JSON) — это поломка валидатора, а
+        # не сигнал "не по теме". Пропускаем статью дальше (fail-open): её тему ещё
+        # раз проверит _validate_topic_llm на готовом пересказе.
+        log.warning("_validate_topic_pre_llm: ответ не распарсился для %s | raw=%r — пропускаем (fail-open)", url, str(raw)[:200])
+        return True, "pre-check недоступен — fail-open"
     if parsed.get("ok") is True:
         return True, "ok"
     return False, parsed.get("reason", "LLM: тема не соответствует дайджесту")
@@ -566,8 +569,10 @@ def _validate_topic_llm(result: dict, url: str) -> tuple[bool, str]:
     raw    = _call_openrouter_raw(_SYSTEM_PROMPT_VALIDATE_TOPIC, user_msg, ref_url=url)
     parsed = _parse_llm_json(raw)
     if parsed is None:
-        log.warning("_validate_topic_llm: не удалось распарсить ответ для %s | raw=%r", url, str(raw)[:200])
-        return False, "не удалось распарсить ответ LLM"
+        # Парс-фейл валидатора не должен ронять уже сгенерированный пересказ —
+        # это поломка проверки, а не доказательство "не по теме". Принимаем (fail-open).
+        log.warning("_validate_topic_llm: ответ не распарсился для %s | raw=%r — принимаем (fail-open)", url, str(raw)[:200])
+        return True, "topic-check недоступен — fail-open"
     if parsed.get("ok") is True:
         return True, "ok"
     return False, parsed.get("reason", "LLM: тема пересказа не соответствует дайджесту")

@@ -64,6 +64,24 @@ FALLBACK_POOL_SIZE = 5
 _groq_pool = None
 _google_pool = None
 
+# Circuit-breaker: когда весь пул провайдера упал (типично — исчерпан суточный
+# лимит), помечаем его "мёртвым" на PROVIDER_COOLDOWN секунд и следующие вызовы
+# в этом же прогоне не тратят на него ~50с (5 моделей × пауза 10с), а идут сразу
+# к рабочему. Состояние в памяти процесса: новый cron-запуск пробует всех заново.
+# ponytail: фиксированный кулдаун — грубо (суточный лимит живёт часами, 5xx —
+# секунды); хватает на один прогон дайджеста, тонкая настройка не нужна.
+PROVIDER_COOLDOWN = 600
+_provider_dead_until = {}  # tag -> epoch, до которого провайдер считается исчерпанным
+
+
+def _in_cooldown(tag: str) -> bool:
+    return _provider_dead_until.get(tag, 0) > time.time()
+
+
+def _mark_dead(tag: str) -> None:
+    _provider_dead_until[tag] = time.time() + PROVIDER_COOLDOWN
+    log.warning("%s помечен исчерпанным на %dс — пропускаем до восстановления", tag, PROVIDER_COOLDOWN)
+
 # Захардкоженного списка моделей нет намеренно: ":free"-модели у OpenRouter
 # регулярно уезжают в платные (gemma-3-27b-it стала отдавать 404 "use the paid
 # slug"), и зашитый фолбэк тихо гниёт — выглядит как страховка, а на деле
@@ -136,6 +154,11 @@ def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "
     Возвращает текст ответа модели или None, если весь пул провалился.
     """
     global _free_models_pool, _batches_processed
+
+    if _in_cooldown("OpenRouter"):
+        # OpenRouter уже признан исчерпанным в этом прогоне — не тратим ~50с на
+        # заведомо мёртвый :free-пул, сразу к фолбэкам.
+        return _finish_with_fallbacks(system_prompt, user_message, ref_url)
 
     force = _batches_processed > 0 and _batches_processed % POOL_REFRESH_INTERVAL == 0
     _init_models_pool(force_refresh=force)
@@ -210,11 +233,15 @@ def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "
             )
             time.sleep(BETWEEN_MODEL_PAUSE)
 
+    _mark_dead("OpenRouter")  # весь :free-пул провалился в этом вызове
+    return _finish_with_fallbacks(system_prompt, user_message, ref_url)
+
+
+def _finish_with_fallbacks(system_prompt: str, user_message: str, ref_url: str) -> str | None:
     fb = _call_fallbacks(system_prompt, user_message)
     if fb is not None:
         log.info("Фолбэк-провайдер отдал ответ для %s", ref_url)
         return fb
-
     log.error("_call_openrouter_raw: все модели и фолбэки провалились для %s", ref_url)
     return None
 
@@ -330,9 +357,10 @@ def _call_fallbacks(system_prompt: str, user_message: str) -> str | None:
         (config.GOOGLE_API_KEY, _google_models, GOOGLE_API_URL, "Google"),
     ]
     for key, models_fn, url, tag in providers:
-        if not key:
+        if not key or _in_cooldown(tag):
             continue
         out = _try_pool(models_fn(), url, key, system_prompt, user_message, tag)
         if out is not None:
             return out
+        _mark_dead(tag)  # весь пул провайдера молчит
     return None
