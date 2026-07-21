@@ -55,11 +55,18 @@ GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 # а список моделей — по нативному эндпоинту с ?key=.
 GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+# Cerebras — OpenAI-совместимый (ключ как Bearer). Все три провайдера ниже —
+# free-tier аккаунты (лимит по частоте, не по деньгам): их /models не содержат
+# платных моделей для такого ключа, поэтому фильтровать "бесплатные" нечего —
+# в отличие от OpenRouter, где это делает суффикс ":free".
+CEREBRAS_API_URL = "https://api.cerebras.ai/v1/chat/completions"
+CEREBRAS_MODELS_URL = "https://api.cerebras.ai/v1/models"
 FALLBACK_POOL_SIZE = 5
 
 # None = список ещё не тянули; [] = тянули, пусто/ошибка (повторно не дёргаем).
 _groq_pool = None
 _google_pool = None
+_cerebras_pool = None
 
 # Захардкоженного списка моделей нет намеренно: ":free"-модели у OpenRouter
 # регулярно уезжают в платные (gemma-3-27b-it стала отдавать 404 "use the paid
@@ -238,7 +245,12 @@ def _openai_chat(url: str, api_key: str, model_id: str,
     )
     if resp.status_code != 200:
         raise ValueError(f"HTTP {resp.status_code}")
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    content = resp.json()["choices"][0]["message"]["content"]
+    # reasoning-модели (qwen, glm…) оборачивают ответ в <think>…</think> прямо в
+    # content — берём хвост после последнего закрывающего тега, парсер ждёт чистый текст.
+    if "</think>" in content:
+        content = content.rsplit("</think>", 1)[-1]
+    return content.strip()
 
 
 def _try_pool(models, url, api_key, system_prompt, user_message, tag) -> str | None:
@@ -315,16 +327,39 @@ def _google_models():
     return _google_pool
 
 
+def _cerebras_models():
+    """Пул моделей Cerebras (кэш на процесс). [] если список не отдался.
+    В /models Cerebras нет поля контекста — берём id в порядке выдачи."""
+    global _cerebras_pool
+    if _cerebras_pool is not None:
+        return _cerebras_pool
+    _cerebras_pool = []
+    try:
+        resp = requests.get(
+            CEREBRAS_MODELS_URL,
+            headers={"Authorization": f"Bearer {config.CEREBRAS_API_KEY}"},
+            proxies=config.PROXIES, timeout=CLASSIFY_TIMEOUT,
+        )
+        resp.raise_for_status()
+        ids = [m.get("id", "") for m in resp.json().get("data", []) if m.get("id")]
+        _cerebras_pool = ids[:FALLBACK_POOL_SIZE]
+        log.info("Cerebras-пул: %s", _cerebras_pool)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Cerebras: не удалось получить список моделей: %s", exc)
+    return _cerebras_pool
+
+
 def _call_fallbacks(system_prompt: str, user_message: str) -> str | None:
-    """Groq -> Google, каждый со своей ротацией лучших моделей. None если оба молчат."""
-    if config.GROQ_API_KEY:
-        out = _try_pool(_groq_models(), GROQ_API_URL, config.GROQ_API_KEY,
-                        system_prompt, user_message, "Groq")
-        if out is not None:
-            return out
-    if config.GOOGLE_API_KEY:
-        out = _try_pool(_google_models(), GOOGLE_API_URL, config.GOOGLE_API_KEY,
-                        system_prompt, user_message, "Google")
+    """Groq -> Google -> Cerebras, каждый со своей ротацией моделей. None если все молчат."""
+    providers = [
+        (config.GROQ_API_KEY,     _groq_models,     GROQ_API_URL,     "Groq"),
+        (config.GOOGLE_API_KEY,   _google_models,   GOOGLE_API_URL,   "Google"),
+        (config.CEREBRAS_API_KEY, _cerebras_models, CEREBRAS_API_URL, "Cerebras"),
+    ]
+    for key, models_fn, url, tag in providers:
+        if not key:
+            continue
+        out = _try_pool(models_fn(), url, key, system_prompt, user_message, tag)
         if out is not None:
             return out
     return None
