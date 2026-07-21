@@ -44,11 +44,22 @@ OPENROUTER_API_URL = os.environ.get(
 )
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
-# Платный фолбэк: когда весь :free-пул OpenRouter отдал 429/5xx (типично —
-# исчерпан суточный лимит free-models-per-day), дожимаем один запрос через Groq
-# (OpenAI-совместимый API). Включается только при заданном config.GROQ_API_KEY.
+# Платные/квотные фолбэки: когда весь :free-пул OpenRouter отдал 429/5xx (типично —
+# исчерпан суточный лимит free-models-per-day), дожимаем через Groq, затем Google.
+# У каждого свой /models: тянем список, оставляем чат-модели, сортируем "лучшие
+# вперёд" и пробуем по очереди — без захардкоженных имён (они у провайдеров
+# уезжают в 404). Включается только при заданном ключе провайдера.
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+# Gemini отдаёт OpenAI-совместимый chat/completions (ключ как Bearer),
+# а список моделей — по нативному эндпоинту с ?key=.
+GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+FALLBACK_POOL_SIZE = 5
+
+# None = список ещё не тянули; [] = тянули, пусто/ошибка (повторно не дёргаем).
+_groq_pool = None
+_google_pool = None
 
 # Захардкоженного списка моделей нет намеренно: ":free"-модели у OpenRouter
 # регулярно уезжают в платные (gemma-3-27b-it стала отдавать 404 "use the paid
@@ -196,41 +207,124 @@ def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "
             )
             time.sleep(BETWEEN_MODEL_PAUSE)
 
-    groq = _call_groq_fallback(system_prompt, user_message)
-    if groq is not None:
-        log.info("Groq-фолбэк отдал ответ для %s", ref_url)
-        return groq
+    fb = _call_fallbacks(system_prompt, user_message)
+    if fb is not None:
+        log.info("Фолбэк-провайдер отдал ответ для %s", ref_url)
+        return fb
 
-    log.error("_call_openrouter_raw: все модели провалились для %s", ref_url)
+    log.error("_call_openrouter_raw: все модели и фолбэки провалились для %s", ref_url)
     return None
 
 
-def _call_groq_fallback(system_prompt: str, user_message: str) -> str | None:
-    """Один запрос к Groq. None, если ключ не задан или запрос не удался."""
-    if not config.GROQ_API_KEY:
-        return None
+def _openai_chat(url: str, api_key: str, model_id: str,
+                 system_prompt: str, user_message: str) -> str:
+    """Один OpenAI-совместимый chat/completions запрос. Бросает при не-200."""
+    resp = requests.post(
+        url,
+        json={
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_message},
+            ],
+            "temperature": 0.1,
+        },
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        proxies=config.PROXIES,
+        timeout=CLASSIFY_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        raise ValueError(f"HTTP {resp.status_code}")
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+def _try_pool(models, url, api_key, system_prompt, user_message, tag) -> str | None:
+    """Пробуем модели пула по очереди; битую/занятую (404/429/5xx) пропускаем."""
+    for mid in models:
+        try:
+            return _openai_chat(url, api_key, mid, system_prompt, user_message)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s %s -> %s, следующая модель", tag, mid, exc)
+    return None
+
+
+def _groq_models():
+    """Пул лучших чат-моделей Groq (кэш на процесс). [] если список не отдался."""
+    global _groq_pool
+    if _groq_pool is not None:
+        return _groq_pool
+    _groq_pool = []
     try:
-        resp = requests.post(
-            GROQ_API_URL,
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_message},
-                ],
-                "temperature": 0.1,
-            },
-            headers={
-                "Authorization": f"Bearer {config.GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            proxies=config.PROXIES,
-            timeout=CLASSIFY_TIMEOUT,
+        resp = requests.get(
+            GROQ_MODELS_URL,
+            headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
+            proxies=config.PROXIES, timeout=CLASSIFY_TIMEOUT,
         )
-        if resp.status_code != 200:
-            log.warning("Groq %d -> фолбэк не сработал", resp.status_code)
-            return None
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        resp.raise_for_status()
+        chat = []
+        for m in resp.json().get("data", []):
+            mid = m.get("id", "")
+            if not m.get("active", True):
+                continue
+            # у Groq в списке ещё аудио/модерация — не для чата
+            if any(x in mid for x in ("whisper", "tts", "guard")):
+                continue
+            chat.append((m.get("context_window") or 0, mid))
+        # ponytail: "лучшая" == наибольший контекст — грубая эвристика, без сигнала
+        # качества из API; ротация всё равно перебирает пул при сбое.
+        chat.sort(reverse=True)
+        _groq_pool = [mid for _, mid in chat[:FALLBACK_POOL_SIZE]]
+        log.info("Groq-пул: %s", _groq_pool)
     except Exception as exc:  # noqa: BLE001
-        log.warning("Groq-фолбэк сетевая/парс ошибка: %s", exc)
-        return None
+        log.warning("Groq: не удалось получить список моделей: %s", exc)
+    return _groq_pool
+
+
+def _google_models():
+    """Пул лучших gemini-моделей (кэш на процесс). [] если список не отдался."""
+    global _google_pool
+    if _google_pool is not None:
+        return _google_pool
+    _google_pool = []
+    try:
+        resp = requests.get(
+            GOOGLE_MODELS_URL,
+            params={"key": config.GOOGLE_API_KEY},
+            proxies=config.PROXIES, timeout=CLASSIFY_TIMEOUT,
+        )
+        resp.raise_for_status()
+        chat = []
+        for m in resp.json().get("models", []):
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            mid = m.get("name", "").split("/", 1)[-1]
+            # только текстовые gemini-* (отсекает lyria/robotics/embedding/imagen…)
+            if not mid.startswith("gemini-") or "robotics" in mid:
+                continue
+            ctx = m.get("inputTokenLimit") or 0
+            # tie-break при равном контексте: стабильные -latest вперёд, preview назад
+            chat.append(((ctx, mid.endswith("-latest"), "preview" not in mid), mid))
+        chat.sort(reverse=True)
+        _google_pool = [mid for _, mid in chat[:FALLBACK_POOL_SIZE]]
+        log.info("Google-пул: %s", _google_pool)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Google: не удалось получить список моделей: %s", exc)
+    return _google_pool
+
+
+def _call_fallbacks(system_prompt: str, user_message: str) -> str | None:
+    """Groq -> Google, каждый со своей ротацией лучших моделей. None если оба молчат."""
+    if config.GROQ_API_KEY:
+        out = _try_pool(_groq_models(), GROQ_API_URL, config.GROQ_API_KEY,
+                        system_prompt, user_message, "Groq")
+        if out is not None:
+            return out
+    if config.GOOGLE_API_KEY:
+        out = _try_pool(_google_models(), GOOGLE_API_URL, config.GOOGLE_API_KEY,
+                        system_prompt, user_message, "Google")
+        if out is not None:
+            return out
+    return None

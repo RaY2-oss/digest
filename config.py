@@ -82,6 +82,11 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 #     Пусто -> фолбэк выключен, поведение как раньше (вернём None).
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
+# 1c) GOOGLE_API_KEY — следующий фолбэк после Groq (Google AI Studio / Gemini).
+#     Ключ с https://aistudio.google.com/apikey , в .env строкой GOOGLE_API_KEY=...
+#     Пусто -> этот фолбэк выключен.
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+
 # 2) TELEGRAM_BOT_TOKEN  — задаётся в /opt/digest/.env (не в этом файле).
 #    Как создать бота:
 #      - В Telegram открыть чат с @BotFather.
