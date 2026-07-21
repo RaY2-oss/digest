@@ -76,6 +76,12 @@ N_CLUSTERS = 20
 #        Бесплатные модели (:free) доступны без пополнения баланса (суточные лимиты).
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
+# 1b) GROQ_API_KEY — платный фолбэк, когда суточный лимит :free-моделей
+#     OpenRouter исчерпан (429 free-models-per-day). Ключ вида "gsk_..." с
+#     https://console.groq.com/keys , в .env строкой GROQ_API_KEY=...
+#     Пусто -> фолбэк выключен, поведение как раньше (вернём None).
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
 # 2) TELEGRAM_BOT_TOKEN  — задаётся в /opt/digest/.env (не в этом файле).
 #    Как создать бота:
 #      - В Telegram открыть чат с @BotFather.

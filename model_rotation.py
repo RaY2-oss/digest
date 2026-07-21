@@ -44,6 +44,12 @@ OPENROUTER_API_URL = os.environ.get(
 )
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
+# Платный фолбэк: когда весь :free-пул OpenRouter отдал 429/5xx (типично —
+# исчерпан суточный лимит free-models-per-day), дожимаем один запрос через Groq
+# (OpenAI-совместимый API). Включается только при заданном config.GROQ_API_KEY.
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
 # Захардкоженного списка моделей нет намеренно: ":free"-модели у OpenRouter
 # регулярно уезжают в платные (gemma-3-27b-it стала отдавать 404 "use the paid
 # slug"), и зашитый фолбэк тихо гниёт — выглядит как страховка, а на деле
@@ -190,5 +196,41 @@ def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "
             )
             time.sleep(BETWEEN_MODEL_PAUSE)
 
+    groq = _call_groq_fallback(system_prompt, user_message)
+    if groq is not None:
+        log.info("Groq-фолбэк отдал ответ для %s", ref_url)
+        return groq
+
     log.error("_call_openrouter_raw: все модели провалились для %s", ref_url)
     return None
+
+
+def _call_groq_fallback(system_prompt: str, user_message: str) -> str | None:
+    """Один запрос к Groq. None, если ключ не задан или запрос не удался."""
+    if not config.GROQ_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            GROQ_API_URL,
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_message},
+                ],
+                "temperature": 0.1,
+            },
+            headers={
+                "Authorization": f"Bearer {config.GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            proxies=config.PROXIES,
+            timeout=CLASSIFY_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            log.warning("Groq %d -> фолбэк не сработал", resp.status_code)
+            return None
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Groq-фолбэк сетевая/парс ошибка: %s", exc)
+        return None
