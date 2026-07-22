@@ -17,6 +17,7 @@ _call_openrouter_raw(): она принимает system-промпт и user-с
 
 import logging
 import os
+import threading
 import time
 
 import requests
@@ -29,10 +30,35 @@ log = logging.getLogger("model_rotation")
 _free_models_pool = []
 _batches_processed = 0
 
+# daily_collector зовёт _call_openrouter_raw из нескольких потоков сразу,
+# поэтому мутации пула идут под замком: без него два потока могли пройти
+# проверку `if x in pool` одновременно, и второй remove() падал с ValueError.
+# Сам HTTP-запрос остаётся ВНЕ замка, иначе параллельность батчей потерялась бы.
+_POOL_LOCK = threading.RLock()
+
+
+def _demote(model_id):
+    """Неудачная модель уходит в конец пула."""
+    with _POOL_LOCK:
+        if model_id in _free_models_pool:
+            _free_models_pool.remove(model_id)
+            _free_models_pool.append(model_id)
+
+
+def _promote(model_id):
+    """Успешная модель встаёт в начало пула."""
+    with _POOL_LOCK:
+        if model_id in _free_models_pool:
+            _free_models_pool.remove(model_id)
+        _free_models_pool.insert(0, model_id)
+
 POOL_REFRESH_INTERVAL = 10    # обновлять список моделей раз в N успешных вызовов
 CLASSIFY_TIMEOUT = 45         # таймаут одного вызова chat/completions, сек
 POOL_SIZE = 5                 # сколько ":free"-моделей держим в пуле одновременно
-BETWEEN_MODEL_PAUSE = 10      # пауза перед сменой модели при 429/5xx, сек
+# BETWEEN_MODEL_PAUSE убран намеренно: 429 у ":free"-моделей почти всегда
+# означает исчерпанный СУТОЧНЫЙ лимит, и пауза в секундах его не лечит — она
+# лишь удлиняет прогон и тратит время впустую. Следующая модель пробуется
+# сразу, а исчерпанный провайдер целиком уходит в кулдаун (PROVIDER_COOLDOWN).
 
 # Переопределяется через .env (config._load_dotenv отработал при import config выше),
 # чтобы пустить вызовы через headroom на 127.0.0.1:8787. Дефолт — прямой OpenRouter,
@@ -197,9 +223,7 @@ def _openrouter_attempt(system_prompt: str, user_message: str, ref_url: str = ""
         except Exception as exc:
             log.warning("_call_openrouter_raw сетевая ошибка %s: %s", model_id, exc)
             # Сетевая ошибка — сразу следующая модель, без паузы.
-            if model_id in _free_models_pool:
-                _free_models_pool.remove(model_id)
-                _free_models_pool.append(model_id)
+            _demote(model_id)
             continue
 
         if resp.status_code == 200:
@@ -213,9 +237,7 @@ def _openrouter_attempt(system_prompt: str, user_message: str, ref_url: str = ""
                     # конец пула, попробуем следующую.
                     raise ValueError(body.get("error", body))
                 content = choices[0]["message"]["content"]
-                if model_id in _free_models_pool:
-                    _free_models_pool.remove(model_id)
-                _free_models_pool.insert(0, model_id)
+                _promote(model_id)
                 _batches_processed += 1
                 return content.strip()
             except Exception as exc:
@@ -229,17 +251,9 @@ def _openrouter_attempt(system_prompt: str, user_message: str, ref_url: str = ""
         else:
             log.warning("%d от %s -> смена модели", resp.status_code, model_id)
 
-        # Пессимизация: неудачная модель уходит в конец пула.
-        if model_id in _free_models_pool:
-            _free_models_pool.remove(model_id)
-            _free_models_pool.append(model_id)
-
+        _demote(model_id)  # пессимизация: неудачная модель уходит в конец пула
         if need_pause:
-            log.info(
-                "Пауза %ds перед переходом к следующей модели (после %s)",
-                BETWEEN_MODEL_PAUSE, model_id,
-            )
-            time.sleep(BETWEEN_MODEL_PAUSE)
+            log.debug("Смена модели после %s без паузы", model_id)
 
     return None  # весь :free-пул провалился; кольцо решит, что дальше
 

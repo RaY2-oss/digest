@@ -22,6 +22,7 @@ import os
 import sqlite3
 
 import config
+import seen_store
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -62,6 +63,7 @@ def main():
     try:
         conn.executescript(SCHEMA_SQL)
         migrate(conn)
+        seen_store.ensure(conn)
         conn.commit()
         print(f"[OK] База инициализирована: {config.DB_PATH}")
     finally:

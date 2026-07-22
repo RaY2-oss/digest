@@ -14,9 +14,10 @@ import sys
 DIRECT = "https://openrouter.ai/api/v1/chat/completions"
 VIA_PROXY = "http://127.0.0.1:8787/v1/chat/completions"
 
+# daily_collector больше не держит собственного URL: в LLM он ходит только
+# через model_rotation._call_openrouter_raw, поэтому источник адреса один.
 CASES = [
     ("model_rotation", "OPENROUTER_API_URL"),
-    ("daily_collector", "_OR_API"),
 ]
 
 
