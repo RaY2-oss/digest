@@ -47,7 +47,10 @@ PROXIES = None  # прямой доступ, WARP недоступен из Alex
 # развернуть в любом каталоге.
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "data", "digest.db")
+# DIGEST_DB_PATH позволяет собрать базу заново в отдельный файл и
+# подменить ею боевую только после успешного прогона.
+DB_PATH = os.environ.get("DIGEST_DB_PATH") or os.path.join(
+    BASE_DIR, "data", "digest.db")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 
