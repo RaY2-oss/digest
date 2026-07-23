@@ -22,6 +22,7 @@ Query #1: et=115, zh-cn=58, de=52, ko=20 при 972 кандидатах.
 # язык и длину статьи. Грубо, но обе величины логируются каждым прогоном
 # (см. daily_collector), так что калибруются по факту, а не на глаз.
 """
+import re
 from datetime import datetime
 
 _V1_MIN_PARTS = 3   # type#name#CC — минимум, чтобы достать код страны
@@ -156,6 +157,26 @@ def select(df, cfg, stats=None):
     max_gap = cfg.get("max_theme_loc_gap")
     min_share = cfg.get("min_country_share")
     extra = [e.lower() for e in (cfg.get("extra_terms") or [])]
+
+    # Дешёвый ВЕКТОРНЫЙ отсев перед построчным разбором. Строка заведомо не
+    # пройдёт, если в её V2-полях нет ни одного целевого имени темы или ни
+    # одного кода страны. Проверка по подстроке — надмножество точного
+    # правила, поэтому ложных пропусков не даёт, а до дорогого разбора
+    # доходят единицы процентов строк. Без этого недельный прогон тратил
+    # ~4.5 часа на одно только сканирование 2.5 млн строк GKG.
+    if len(df) and themes and locations:
+        v2t_s = df["v2t"].fillna("") if "v2t" in df.columns else None
+        v2l_s = df["v2l"].fillna("") if "v2l" in df.columns else None
+        if v2t_s is not None and v2l_s is not None:
+            t_pat = "|".join(re.escape(t) for t in themes)
+            l_pat = "|".join(re.escape("#%s#" % c) for c in locations)
+            hit = (v2t_s.str.contains(t_pat, regex=True, na=False)
+                   & v2l_s.str.contains(l_pat, regex=True, na=False))
+            # Строки вообще без полей V2 идут дальше — их рассудит judge_v1.
+            no_v2 = (v2t_s.str.len() == 0) & (v2l_s.str.len() == 0)
+            df = df[hit | no_v2]
+            if df.empty:
+                return []
 
     out = {}
     for row in df.itertuples(index=False):
