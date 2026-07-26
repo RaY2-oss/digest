@@ -7,6 +7,10 @@ __pycache__/
 venv/
 .cache/
 
+# --- local tool artifacts ---
+graphify-out/
+lab/*.out
+
 # --- runtime data & generated artifacts ---
 data/
 logs/

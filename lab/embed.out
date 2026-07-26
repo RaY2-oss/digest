@@ -1,36 +1,0 @@
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights:  49%|████▊     | 97/199 [00:00<00:00, 968.77it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 995.33it/s]
-Статей в БД (все прошли LLM-фильтр): 1341
-
--- max cos к ПОЛОЖИТЕЛЬНЫМ прототипам --
-  p01 = 0.7585
-  p02 = 0.7623
-  p05 = 0.7693
-  p10 = 0.7747
-  p25 = 0.7878
-  p50 = 0.7992
-  p75 = 0.8104
-  p90 = 0.8215
-
--- margin = max_pos - max_neg --
-  p01 = -0.0093
-  p02 = -0.0037
-  p05 = +0.0049
-  p10 = +0.0128
-  p25 = +0.0243
-  p50 = +0.0369
-  p75 = +0.0486
-  p90 = +0.0617
-
-  доля с margin > 0 : 97.2%
-  доля с margin > 0.00: 97.2%
-  доля с margin > 0.01: 92.0%
-  доля с margin > 0.02: 82.1%
-  доля с margin > 0.03: 64.8%
-  доля с margin > 0.05: 22.8%
-
--- по регионам (медиана margin) --
-  CA   n= 160  med=+0.0498
-  MIX  n= 320  med=+0.0356
-  SC   n= 156  med=+0.0364
-  TR   n= 705  med=+0.0363
