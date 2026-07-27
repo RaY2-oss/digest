@@ -78,8 +78,12 @@ GKG_URL_TL = "http://data.gdeltproject.org/gdeltv2/{ts}.translation.gkg.csv.zip"
 # Колонки 8 и 10 (V2EnhancedThemes / V2EnhancedLocations) несут символьные
 # офсеты каждого упоминания — по ним gkg_filter восстанавливает связь темы и
 # страны, которой в V1-полях (7 и 9) физически нет.
-GKG_USECOLS = [1, 3, 4, 7, 8, 9, 10]
-GKG_COLNAMES = ["date", "source", "url", "v1t", "v2t", "v1l", "v2l"]
+# Колонки 11 и 13 (V1Persons / V1Organizations) — NER самого GDELT, наш
+# «словарь политических субъектов» против локального шума (см. entities.py).
+# Порядок обязан быть возрастающим: pandas раздаёт names по позиции выбранных
+# колонок в файле.
+GKG_USECOLS = [1, 3, 4, 7, 8, 9, 10, 11, 13]
+GKG_COLNAMES = ["date", "source", "url", "v1t", "v2t", "v1l", "v2l", "v1p", "v1o"]
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
@@ -321,8 +325,8 @@ def fetch_gdelt(query_index, week_mode=False):
     for i, ts in enumerate(timestamps, start=1):
         for translation in (False, True):
             df = fetch_gkg_file(ts, translation=translation)
-            for url, gkg_date in gkg_filter.select(df, cfg, stats):
-                seen.setdefault(url, gkg_date)
+            for url, gkg_date, ents in gkg_filter.select(df, cfg, stats):
+                seen.setdefault(url, (gkg_date, ents))
 
         if i % 20 == 0 or i == len(timestamps):
             log.info("  [%s] %d/%d тиков, URL найдено: %d",
@@ -345,7 +349,7 @@ def fetch_gdelt(query_index, week_mode=False):
     if shares:
         p = np.percentile(shares, [10, 25, 50])
         log.info("  доля целевой страны у прошедших: p10=%.2f p25=%.2f p50=%.2f", *p)
-    return [{"url": u, "gkg_date": d} for u, d in seen.items()]
+    return [{"url": u, "gkg_date": d, "entities": e} for u, (d, e) in seen.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -513,17 +517,17 @@ def cluster_duplicates(embs, threshold):
 
 
 def flush_batch(conn, batch):
-    """batch items: (qi, url, fetch_date, publish_date, title, text, region, lang, emb)"""
+    """batch items: (qi, url, fetch_date, publish_date, title, text, region, lang, entities, emb)"""
     if not batch:
         return 0
     inserted = 0
-    for (qi, url, fd, pdate, title, text, bucket, lang, emb) in batch:
+    for (qi, url, fd, pdate, title, text, bucket, lang, ents, emb) in batch:
         try:
             conn.execute(
                 "INSERT OR IGNORE INTO articles "
-                "(query_index,url,fetch_date,publish_date,title,text,embedding,region_bucket,language) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (qi, url, fd, pdate, title, text, emb.tobytes(), bucket, lang))
+                "(query_index,url,fetch_date,publish_date,title,text,embedding,region_bucket,language,entities) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (qi, url, fd, pdate, title, text, emb.tobytes(), bucket, lang, ents))
             inserted += 1
         except Exception as exc:
             log.warning("INSERT error %s: %s", url, exc)
@@ -553,7 +557,7 @@ def main():
 
             # 1) Очередь нерешённых разбирается ДО новых дампов: это статьи,
             #    по которым в прошлый раз молчали все провайдеры.
-            queue = [(u, None) for u in seen_store.pending_urls(conn, qi)]
+            queue = [(u, None, "") for u in seen_store.pending_urls(conn, qi)]
             if queue:
                 log.info("Query #%d: %d URL из очереди pending", qi, len(queue))
 
@@ -561,16 +565,16 @@ def main():
             #    Раньше проверка шла по таблице articles, где лежат только
             #    ПРИНЯТЫЕ статьи, поэтому отклонённые возвращались каждые 6
             #    часов — 61.7% работы прогона уходило на повтор.
-            fresh = [(a["url"], a["gkg_date"])
+            fresh = [(a["url"], a["gkg_date"], a["entities"])
                      for a in fetch_gdelt(qi, week_mode=week_mode)]
-            decided = seen_store.final_urls(conn, [u for u, _ in fresh])
-            queue += [(u, d) for u, d in fresh if u not in decided]
+            decided = seen_store.final_urls(conn, [u for u, _, _ in fresh])
+            queue += [(u, d, e) for u, d, e in fresh if u not in decided]
             log.info("Query #%d: найдено %d, из них решены ранее %d, к обработке %d",
                      qi, len(fresh), len(decided), len(queue))
 
             # 3) Загрузка страниц и дешёвые правила.
             cands, marks = [], []
-            for url, gkg_date in queue:
+            for url, gkg_date, ents in queue:
                 text, title, html_date = fetch_and_extract(url)
                 if not text or len(text) < config.MIN_TEXT_LENGTH:
                     marks.append((url, qi, "short", None))
@@ -579,7 +583,7 @@ def main():
                 if is_non_event_article(url, title, text):
                     marks.append((url, qi, "non_event", None))
                     continue
-                cands.append((url, text, html_date or gkg_date, title, lang))
+                cands.append((url, text, html_date or gkg_date, title, lang, ents))
             seen_store.mark(conn, marks, fetch_date)
             if not cands:
                 log.info("Query #%d: кандидатов после правил не осталось", qi)
@@ -621,7 +625,7 @@ def main():
 
             # 8) Вердикт кластера распространяется на всех его членов.
             marks, batch = [], []
-            for i, (url, text, pdate, title, lang) in enumerate(cands):
+            for i, (url, text, pdate, title, lang, ents) in enumerate(cands):
                 v = verdicts.get(reps[labels[i]])
                 if v is None:
                     marks.append((url, qi, "pending", None))
@@ -629,7 +633,8 @@ def main():
                     marks.append((url, qi, "rejected", embs[i]))
                 else:
                     marks.append((url, qi, "accepted", embs[i]))
-                    batch.append((qi, url, fetch_date, pdate, title, text, v, lang, embs[i]))
+                    batch.append((qi, url, fetch_date, pdate, title, text, v, lang,
+                                  ents, embs[i]))
             seen_store.mark(conn, marks, fetch_date)
             for k in range(0, len(batch), BATCH_SIZE):
                 total_new += flush_batch(conn, batch[k:k + BATCH_SIZE])

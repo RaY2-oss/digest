@@ -15,7 +15,8 @@ init_db.py — одноразовая инициализация базы дан
     fetch_date   DATE                 — дата загрузки (YYYY-MM-DD);
     title        TEXT                 — заголовок из GDELT;
     text         TEXT                 — полный текст статьи (trafilatura);
-    embedding    BLOB                 — numpy float32 вектор (384 dim) в bytes.
+    embedding    BLOB                 — numpy float32 вектор (384 dim) в bytes;
+    entities     TEXT                 — персоны/организации из GKG (entities.py).
 """
 
 import os
@@ -35,7 +36,8 @@ CREATE TABLE IF NOT EXISTS articles (
     text          TEXT,
     embedding     BLOB,
     region_bucket TEXT,
-    language      TEXT
+    language      TEXT,
+    entities      TEXT
 );
 
 -- Индекс по дате ускоряет выборку "за последние 7 дней" и очистку старых строк.
@@ -45,6 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_articles_fetch_date ON articles(fetch_date);
 
 MIGRATIONS = [
     ("language", "TEXT"),
+    ("entities", "TEXT"),   # субъекты из GKG V1Persons/V1Organizations, см. entities.py
 ]
 
 

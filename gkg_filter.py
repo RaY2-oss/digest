@@ -25,6 +25,8 @@ Query #1: et=115, zh-cn=58, de=52, ko=20 при 972 кандидатах.
 import re
 from datetime import datetime
 
+import entities
+
 _V1_MIN_PARTS = 3   # type#name#CC — минимум, чтобы достать код страны
 _V2_MIN_PARTS = 9   # ...#featureid#offset — офсет последним полем
 
@@ -143,8 +145,12 @@ def _gkg_date(raw):
 
 
 def select(df, cfg, stats=None):
-    """df — дамп GKG с колонками url,date,source,v1t,v2t,v1l,v2l.
-    cfg — элемент config.QUERIES_GKG. -> [(url, gkg_date), ...]
+    """df — дамп GKG с колонками url,date,source,v1t,v2t,v1l,v2l (+v1p,v1o).
+    cfg — элемент config.QUERIES_GKG. -> [(url, gkg_date, entities), ...]
+
+    entities — субъекты статьи из V1Persons/V1Organizations, склеенные
+    entities.parse (см. entities.py: политический вес против локального шума).
+    Колонок v1p/v1o в df может не быть — тогда строка просто пустая.
 
     stats — необязательный dict-счётчик; заполняется для лога, чтобы пороги
     max_theme_loc_gap / min_country_share подбирались по наблюдаемым
@@ -210,5 +216,7 @@ def select(df, cfg, stats=None):
                 stats.setdefault("shares", []).append(share)
 
         if ok:
-            out[url] = _gkg_date(getattr(row, "date", ""))
-    return list(out.items())
+            out[url] = (_gkg_date(getattr(row, "date", "")),
+                        entities.parse(getattr(row, "v1p", ""),
+                                       getattr(row, "v1o", "")))
+    return [(u, d, e) for u, (d, e) in out.items()]

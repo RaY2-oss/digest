@@ -25,7 +25,18 @@ to repurpose this for a different beat.
 3. **`sunday_processor_mmr.py`** (cron, weekly) — builds the digest from the
    week's accepted articles: LLM re-tells/summarizes each one, then MMR
    (Maximal Marginal Relevance) selects a diverse, non-redundant top-N per
-   region quota.
+   region quota. Article importance blends LexRank over the cosine-similarity
+   graph with a *political weight* (`entities.py`): LexRank only measures how
+   dense an article's neighbourhood is, so a dozen near-identical local pieces
+   ("village pupil aces the national exam") form the same tight clique as a
+   genuine national story. The second factor counts how many *distinct
+   prominent* actors the article names — persons/organizations GDELT already
+   extracted (`V1Persons`/`V1Organizations`), prominent meaning they recur in
+   at least `ENTITY_MIN_DF` articles of the week's corpus. No external
+   dictionary of political names is downloaded: prominence is derived from our
+   own corpus, so it is multilingual and self-updating. Tunable via
+   `config.ENTITY_*`; `ENTITY_WEIGHT = 0` restores plain LexRank, and the
+   factor stays off by itself while no actor clears the threshold.
 4. **`word_generator.py`** renders the selection to a `.docx`.
 5. **`telegram_sender.py`** delivers it to the configured chat.
 6. **`telegram_bot_listener.py`** — long-polling bot exposing `/rundigest`

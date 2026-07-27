@@ -27,8 +27,9 @@ sunday_processor_mmr.py — воскресная обработка: отбор 
 
 MMR-формула (lambda=0.5):
 score(d) = lambda * importance(d) - (1-lambda) * max_{s in S} sim(d, s)
-где importance(d) = LexRank-скор статьи в графе косинусных схожестей
-корзины (степенная итерация, аналог PageRank), нормализованный в [0, 1],
+где importance(d) — см. _importance(): LexRank-скор статьи в графе косинусных
+схожестей корзины (степенная итерация, аналог PageRank), нормализованный
+в [0, 1], смешанный с политическим весом статьи,
 S = уже выбранные статьи (нарастающий список),
 sim = косинусное сходство.
 
@@ -39,6 +40,14 @@ sim = косинусное сходство.
 важной, если на неё "похожи" другие статьи, которые сами хорошо связаны
 с остальными (т.е. её сюжет широко перекликается с другими материалами
 недели), без жёсткого порога отсечения, как при кластеризации.
+
+Почему одного LexRank мало: он меряет ТОЛЬКО плотность связей, поэтому пачка
+однотипных локальных заметок (десяток текстов «школьник сдал экзамен на
+максимум баллов») образует такую же плотную клику, как настоящий
+общенациональный сюжет. Второй фактор смотрит на субъектов статьи —
+персоны/организации, которых GDELT уже извлёк за нас, — и поднимает те, где
+фигурируют субъекты, о которых пишет и вся остальная лента (см. entities.py,
+config.ENTITY_*).
 """
 
 import json
@@ -52,6 +61,7 @@ import sys
 import numpy as np
 
 import config
+import entities
 from model_rotation import _call_openrouter_raw
 from word_generator import build_digest
 from telegram_sender import send_document
@@ -95,7 +105,7 @@ LEXRANK_TOL = 1e-6
 # ---------------------------------------------------------------------------
 def load_week_articles(conn):
     rows = conn.execute(
-        "SELECT url, text, embedding, publish_date, region_bucket FROM articles "
+        "SELECT url, text, embedding, publish_date, region_bucket, entities FROM articles "
         "WHERE ("
         " (publish_date IS NOT NULL AND publish_date >= date('now', '-7 days'))"
         " OR"
@@ -104,8 +114,17 @@ def load_week_articles(conn):
         "AND embedding IS NOT NULL"
     ).fetchall()
 
+    # Док-частота субъектов по всему недельному корпусу — самонастраивающийся
+    # «словарь» заметных персон/организаций (см. entities.py). Пока в нём нет
+    # ни одного субъекта выше порога (старая база без колонки entities), фактор
+    # молча выключается: политический вес у всех статей = 0.
+    ent_df = entities.document_freq(r[5] for r in rows)
+    known = sum(1 for v in ent_df.values() if v >= config.ENTITY_MIN_DF)
+    if not known:
+        ent_df = None
+
     articles = []
-    for url, text, blob, pub_date, bucket in rows:
+    for url, text, blob, pub_date, bucket, ents in rows:
         if not blob:
             continue
         emb = np.frombuffer(blob, dtype=np.float32).copy()
@@ -115,9 +134,13 @@ def load_week_articles(conn):
                 url, emb.shape[0], config.EMBEDDING_DIM,
             )
             continue
-        articles.append((url, text, emb, pub_date or "", bucket or "MIX"))
+        prom = 0.0 if ent_df is None else entities.weight(
+            entities.prominent(ents, ent_df, config.ENTITY_MIN_DF),
+            config.ENTITY_FULL_AT)
+        articles.append((url, text, emb, pub_date or "", bucket or "MIX", prom))
 
-    log.info("Загружено статей за неделю: %d", len(articles))
+    log.info("Загружено статей за неделю: %d | заметных субъектов в словаре: %d",
+             len(articles), known)
     return articles
 
 # ---------------------------------------------------------------------------
@@ -175,6 +198,33 @@ def _lexrank_scores(
     return scores
 
 
+def _importance(subset: list, embeddings: np.ndarray) -> np.ndarray:
+    """Важность статей корзины в [0, 1]: LexRank + политический вес.
+
+    LexRank нормализуется в [0,1] и смешивается с уже посчитанным при загрузке
+    политическим весом статьи (subset[i][5], см. load_week_articles):
+
+        importance = (1 - W) * lexrank + W * политический_вес,  W = ENTITY_WEIGHT
+
+    Если фактор выключен (W=0) или по корзине нет ни одного заметного субъекта,
+    возвращается чистый LexRank — прежнее поведение.
+    """
+    rel = _lexrank_scores(embeddings)
+    r_min, r_max = float(rel.min()), float(rel.max())
+    if r_max - r_min > 1e-12:
+        rel = (rel - r_min) / (r_max - r_min)
+    else:
+        rel = np.full_like(rel, 0.5)
+
+    w = config.ENTITY_WEIGHT
+    if w <= 0:
+        return rel
+    prom = np.array([a[5] for a in subset], dtype=np.float64)
+    if not prom.any():
+        return rel
+    return (1.0 - w) * rel + w * prom
+
+
 def _max_cosine_to_selected(emb: np.ndarray, selected_embs: list[np.ndarray]) -> float:
     """
     Возвращает максимальное косинусное сходство кандидата
@@ -217,12 +267,7 @@ def _mmr_pick(subset: list, n_pick: int, lam: float = MMR_LAMBDA) -> list:
         return list(subset)
 
     embeddings = np.vstack([a[2] for a in subset]).astype(np.float32)
-    rel_scores = _lexrank_scores(embeddings)
-    r_min, r_max = float(rel_scores.min()), float(rel_scores.max())
-    if r_max - r_min > 1e-12:
-        rel_scores = (rel_scores - r_min) / (r_max - r_min)
-    else:
-        rel_scores = np.full_like(rel_scores, 0.5)
+    rel_scores = _importance(subset, embeddings)
 
     selected_idx = []
     candidate_mask = np.ones(len(subset), dtype=bool)
@@ -253,7 +298,8 @@ def _mmr_pick(subset: list, n_pick: int, lam: float = MMR_LAMBDA) -> list:
 
 def _rank_by_importance(subset: list) -> list:
     """
-    Сортирует статьи по LexRank-важности (убывание), БЕЗ диверсити-члена MMR.
+    Сортирует статьи по важности (LexRank + политический вес, см. _importance),
+    БЕЗ диверсити-члена MMR.
 
     Используется для регионального резерва (замена нерелевантных статей):
     диверсити тут не нужен, т.к. семантические дубликаты уже отсекаются
@@ -265,7 +311,7 @@ def _rank_by_importance(subset: list) -> list:
         return list(subset)
 
     embeddings = np.vstack([a[2] for a in subset]).astype(np.float32)
-    scores = _lexrank_scores(embeddings)
+    scores = _importance(subset, embeddings)
     order = np.argsort(-scores)
     return [subset[i] for i in order]
 
@@ -641,7 +687,7 @@ def _process_slot(
 
     candidates = [(primary_url, primary_text, primary_emb, primary_pub_date)]
     for item in regional_reserves.get(primary_bucket, []):
-        r_url, r_text, r_emb, r_pub_date, _ = item
+        r_url, r_text, r_emb, r_pub_date = item[:4]
         if r_url not in processed_urls:
             candidates.append((r_url, r_text, r_emb, r_pub_date))
 
@@ -821,7 +867,7 @@ def main():
         accepted_embeddings: list[np.ndarray] = []
         target = config.N_CLUSTERS
 
-        for url, text, emb, pub_date, bucket in reps:
+        for url, text, emb, pub_date, bucket, _prom in reps:
             if len(summaries) >= target:
                 break
             if url in processed_urls:
