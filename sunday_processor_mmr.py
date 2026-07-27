@@ -41,6 +41,11 @@ sim = косинусное сходство.
 с остальными (т.е. её сюжет широко перекликается с другими материалами
 недели), без жёсткого порога отсечения, как при кластеризации.
 
+LexRank считается ПО КОРЗИНЕ (региону) — см. select_representatives: граф
+строится внутри TR/CA/SC отдельно, поэтому крупный регион не топит малый.
+Рёбра внутри одного домена обнулены (см. _lexrank_scores): пять версий
+текста на одном сайте — один голос, а не клика из пяти.
+
 Почему одного LexRank мало: он меряет ТОЛЬКО плотность связей, поэтому пачка
 однотипных локальных заметок (десяток текстов «школьник сдал экзамен на
 максимум баллов») образует такую же плотную клику, как настоящий
@@ -62,6 +67,7 @@ import numpy as np
 
 import config
 import entities
+import importance
 from model_rotation import _call_openrouter_raw
 from word_generator import build_digest
 from telegram_sender import send_document
@@ -156,6 +162,7 @@ def _lexrank_scores(
     damping: float = LEXRANK_DAMPING,
     max_iter: int = LEXRANK_MAX_ITER,
     tol: float = LEXRANK_TOL,
+    domains: list | None = None,
 ) -> np.ndarray:
     """
     LexRank-важность статей корзины: степенная итерация (аналог PageRank)
@@ -176,6 +183,15 @@ def _lexrank_scores(
     sim = _cosine_matrix(embeddings, embeddings).astype(np.float64)
     np.fill_diagonal(sim, 0.0)
     sim = np.clip(sim, 0.0, None)  # отрицательную "схожесть" не переносим как вес ребра
+
+    # Рёбра между статьями ОДНОГО издания обнуляются. LexRank меряет плотность
+    # связей, и издание, выкатившее пять версий одного текста, образует плотную
+    # клику, которая накачивает сама себя, — ровно тот локальный шум, против
+    # которого фактор и вводился. Пять версий на одном сайте должны весить как
+    # один голос, а не как пять.
+    if domains is not None:
+        d = np.asarray(domains, dtype=object)
+        sim[(d[:, None] == d[None, :]) & (d[:, None] != "")] = 0.0
 
     row_sums = sim.sum(axis=1, keepdims=True)
     dangling = (row_sums.flatten() == 0.0)
@@ -209,7 +225,8 @@ def _importance(subset: list, embeddings: np.ndarray) -> np.ndarray:
     Если фактор выключен (W=0) или по корзине нет ни одного заметного субъекта,
     возвращается чистый LexRank — прежнее поведение.
     """
-    rel = _lexrank_scores(embeddings)
+    rel = _lexrank_scores(embeddings,
+                          domains=[importance.domain(a[0]) for a in subset])
     r_min, r_max = float(rel.min()), float(rel.max())
     if r_max - r_min > 1e-12:
         rel = (rel - r_min) / (r_max - r_min)

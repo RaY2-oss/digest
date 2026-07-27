@@ -61,6 +61,8 @@ import seen_store
 from model_rotation import _call_openrouter_raw
 
 os.environ.setdefault("HF_HOME", "/opt/digest/.cache/huggingface")
+# Модель лежит в кэше целиком, ходить за ней в сеть незачем. Без этого каждый
+# прогон делает ~20 HEAD-запросов к huggingface.co: лишняя задержка и жёсткая
 DetectorFactory.seed = 0  # детерминированный langdetect
 
 # ---------------------------------------------------------------------------
@@ -259,7 +261,18 @@ def get_model():
     if _model is None:
         from sentence_transformers import SentenceTransformer
         log.info("Loading embedding model %s ...", config.EMBEDDING_MODEL)
-        _model = SentenceTransformer(config.EMBEDDING_MODEL)
+        # backend="onnx", а не torch: у процессора этого VPS (QEMU, только до
+        # sse4_2) нет ни AVX, ни AVX2, а MKL внутри torch+cpu всё равно
+        # выполняет VEX-инструкцию и ядро убивает процесс по SIGILL — без
+        # трейсбека, целиком. onnxruntime считает своей математикой (MLAS) с
+        # честной диспетчеризацией под старый CPU. Вектора совпадают с torch,
+        # поэтому уже сохранённые в БД эмбеддинги остаются сравнимыми и
+        # переиндексация не нужна. Тот же приём, что в /opt/gdelt_rss.
+        # local_files_only — см. тот же приём в /opt/gdelt_rss: модель в кэше,
+        # ~20 HEAD-запросов к huggingface.co на прогон не нужны.
+        _model = SentenceTransformer(config.EMBEDDING_MODEL, backend="onnx",
+                                     model_kwargs={"file_name": "onnx/model.onnx"},
+                                     local_files_only=True)
         log.info("Model loaded.")
     return _model
 
