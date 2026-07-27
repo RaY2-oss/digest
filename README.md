@@ -51,8 +51,10 @@ zero-downtime rebuilds of the database.
    - `GROQ_API_KEY` (optional fallback) — https://console.groq.com/keys
    - `GOOGLE_API_KEY` (optional fallback) — https://aistudio.google.com/apikey
    - `TELEGRAM_BOT_TOKEN` — via `@BotFather`.
-3. Edit `config.py`: `TELEGRAM_CHAT_ID`, `ALLOWED_TG_USER_IDS` (who may run
-   `/rundigest`), and `QUERIES_GKG` (your own topic/country filters).
+   - `TELEGRAM_CHAT_ID` — chat/channel to broadcast the weekly digest to.
+   - `ALLOWED_TG_USER_IDS` (optional) — comma-separated user IDs allowed to
+     run `/rundigest` manually; leave empty to allow everyone.
+3. Edit `config.py`: `QUERIES_GKG` (your own topic/country filters).
 4. `venv/bin/python init_db.py`
 5. Wire up cron: `daily_collector.py` every 6h, `sunday_processor_mmr.py`
    weekly, `cleanup_old_articles.py` daily, `telegram_bot_listener.py` as a
