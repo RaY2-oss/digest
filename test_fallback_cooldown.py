@@ -22,6 +22,8 @@ def test_openrouter_cooldown_skips_pool():
     m._pool_refresh_failed = False
     m._batches_processed = 0
     m._provider_dead_until.clear()
+    m._provider_strikes.clear()
+    m._wait_spent = m.RING_WAIT_BUDGET  # без бюджета ожидания кольцо падает сразу
     m.requests.post = fake_post
     m.time.sleep = lambda *a, **k: None
     config.OPENROUTER_API_KEY = "x"

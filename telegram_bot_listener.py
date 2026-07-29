@@ -9,6 +9,7 @@ sunday_processor_mmr.py по команде /rundigest.
 
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -56,6 +57,21 @@ def is_running():
 VENV_PYTHON = os.path.join(os.path.dirname(__file__), "venv", "bin", "python3")
 
 
+def _articles_note(stdout):
+    """Дописывает к "✅ отправлен" реальное число статей, если их меньше плана.
+    Процессор при исчерпанных LLM-провайдерах отдаёт валидный, но куцый дайджест
+    (бывало 1 статья из 20) и выходит с кодом 0 — без этой приписки короткий
+    дайджест выглядел бы как нормальный."""
+    m = re.search(r"^DIGEST_ARTICLES=(\d+)/(\d+)$", stdout or "", re.M)
+    if not m:
+        return ""
+    got, target = int(m.group(1)), int(m.group(2))
+    if got >= target:
+        return f" Статей: {got}."
+    return (f"\n⚠️ Статей всего {got} из {target}: LLM-провайдеры были "
+            f"исчерпаны. Проверьте logs/processor.log и запустите позже.")
+
+
 def run_processor(chat_id):
     if is_running():
         send_message(chat_id, "\u23f3 Обработка уже запущена, дождитесь завершения.")
@@ -77,7 +93,7 @@ def run_processor(chat_id):
             env=env,
         )
         if result.returncode == 0:
-            send_message(chat_id, "\u2705 Дайджест сформирован и отправлен.")
+            send_message(chat_id, "\u2705 Дайджест сформирован и отправлен." + _articles_note(result.stdout))
         else:
             log.error("sunday_processor_mmr завершился с ошибкой: %s", result.stderr[-2000:])
             send_message(chat_id, "\u274c Ошибка при формировании дайджеста. Проверьте logs/processor.log.")

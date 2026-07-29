@@ -75,7 +75,7 @@ import config
 import entities
 import importance
 import translate_ru
-from model_rotation import _call_openrouter_raw
+from model_rotation import _call_openrouter_raw, providers_exhausted
 from word_generator import build_digest
 from telegram_sender import send_document
 
@@ -739,6 +739,14 @@ def _process_slot(
 
         result = _retell_article(url, text, pub_date, slot_label)
         if result is None:
+            # Провал пересказа при мёртвых провайдерах — это не "статья плохая",
+            # а "LLM недоступна". Перебор резерва в таком состоянии просто
+            # выжигает корзину за секунды и оставляет слот пустым; выходим сразу,
+            # чтобы следующие слоты не потеряли ещё и свои кандидаты.
+            if providers_exhausted():
+                log.error(" %s: LLM недоступна — прекращаем перебор резерва %s.",
+                          slot_label, primary_bucket)
+                return None
             log.warning(
                 " %s: пересказ/формат не прошёл для %s — берём следующую из корзины %s",
                 slot_label, url, primary_bucket,
@@ -920,8 +928,12 @@ def main():
                 summaries.append(result)
             else:
                 log.warning("Слот %d не заполнен.", len(summaries) + 1)
+                if providers_exhausted():
+                    log.error("LLM недоступна — набор слотов прерван на %d из %d.",
+                              len(summaries), target)
+                    break
 
-        log.info("Итого пересказано статей: %d", len(summaries))
+        log.info("Итого пересказано статей: %d из %d", len(summaries), target)
 
         if not summaries:
             log.error("Нет пересказанных статей — дайджест не формируется.")
@@ -958,6 +970,9 @@ def main():
             log.error("Не удалось отправить документ в Telegram (см. errors.log).")
 
         cleanup_old(conn)
+        # Машиночитаемый итог в stdout: telegram_bot_listener читает его, чтобы
+        # не отвечать бодрым "✅ сформирован", когда слотов набралось 5 из 20.
+        print(f"DIGEST_ARTICLES={len(summaries)}/{target}", flush=True)
         log.info("=== Готово ===")
     finally:
         conn.close()
