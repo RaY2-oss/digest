@@ -23,7 +23,8 @@ to repurpose this for a different beat.
    across OpenRouter's free-tier models, then falls back to Groq, then
    Google (Gemini), round-robin, with per-provider cooldown on exhaustion.
 3. **`sunday_processor_mmr.py`** (cron, weekly) — builds the digest from the
-   week's accepted articles: LLM re-tells/summarizes each one, then MMR
+   week's accepted articles: LLM re-tells/summarizes each one **in English**,
+   then MMR
    (Maximal Marginal Relevance) selects a diverse, non-redundant top-N per
    region quota. Article importance blends LexRank over the cosine-similarity
    graph with a *political weight* (`entities.py`): LexRank only measures how
@@ -37,9 +38,18 @@ to repurpose this for a different beat.
    own corpus, so it is multilingual and self-updating. Tunable via
    `config.ENTITY_*`; `ENTITY_WEIGHT = 0` restores plain LexRank, and the
    factor stays off by itself while no actor clears the threshold.
-4. **`word_generator.py`** renders the selection to a `.docx`.
-5. **`telegram_sender.py`** delivers it to the configured chat.
-6. **`telegram_bot_listener.py`** — long-polling bot exposing `/rundigest`
+4. **Translation to Russian** — the LLM writes English on purpose; the final
+   Russian text comes from a local Marian model (`opus-mt-tc-big-en-zle` via
+   CTranslate2 int8, `translate_ru.py`), run *after* the dedup pass so
+   duplicate detection compares stable English rather than two diverging
+   translations. Proper names go through a shared glossary (`glossary.py`):
+   `keep` terms are masked before translation and restored in Latin script,
+   `ru` terms that leaked through untranslated are replaced with their
+   accepted Russian form. This replaced asking the LLM to transliterate names
+   itself, which it did inconsistently from call to call.
+5. **`word_generator.py`** renders the selection to a `.docx`.
+6. **`telegram_sender.py`** delivers it to the configured chat.
+7. **`telegram_bot_listener.py`** — long-polling bot exposing `/rundigest`
    (manual trigger) and `/resetlock` (clears a stuck run lock).
 
 `prefilter.py` / `train_prefilter.py` add an optional local classifier,
@@ -50,12 +60,35 @@ labeled history has accumulated (`PREFILTER_MIN_LABELS`).
 `cleanup_old_articles.py` and `week_swap_run.sh` handle retention and
 zero-downtime rebuilds of the database.
 
+`embedder.py` talks to onnxruntime directly instead of going through
+`sentence-transformers`. The CPU this runs on has no AVX, and every path that
+reaches `torch` dies by `SIGILL` — see the same note in `gdelt_rss`'s README.
+
+## Shared with `gdelt_rss`
+
+Two modules are not copies but symlinks into the sibling project, which owns
+them:
+
+| link | target |
+| --- | --- |
+| `glossary.py` | `../gdelt_rss/glossary.py` |
+| `translate_ru.py` | `../gdelt_rss/translate_ru.py` |
+
+So **clone both repos side by side** — `git clone …/gdelt_rss` next to this
+one — or the links dangle and step 4 of the pipeline fails. Both modules are
+env-configurable and hold no project-specific state; the machine-level
+resources they need live outside either repo:
+
+- `/opt/translate/ct2/tcbig-en-ru` — the CTranslate2-converted model
+  (`CT2_DIR`).
+- `/opt/translate/models` — Hugging Face cache for the tokenizer
+  (`TRANSLATE_HF_HOME`).
+- `/opt/translate/glossary*.tsv` — the proper-name dictionary, tab-separated
+  `source⇥replacement⇥mode` where mode is `keep` or `ru` (`GLOSSARY_DIR`).
+
 ## Setup
 
 1. `python -m venv venv && venv/bin/pip install -r requirements.txt`
-   (no `requirements.txt` yet — see packages imported across the `.py`
-   files: `requests`, `pandas`, `numpy`, `scikit-learn`, `sentence-transformers`,
-   `trafilatura`, `htmldate`, `langdetect`, `python-docx`, `joblib`).
 2. Copy `.env.example` to `.env` and fill in:
    - `OPENROUTER_API_KEY` — https://openrouter.ai/keys (free `:free` models
      work without billing).

@@ -1,1 +1,1 @@
-/opt/gdelt_rss/translate_ru.py
+../gdelt_rss/translate_ru.py
