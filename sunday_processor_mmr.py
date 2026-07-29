@@ -15,15 +15,20 @@ sunday_processor_mmr.py — воскресная обработка: отбор 
 4. Для каждого слота из пула — пересказ через _call_openrouter_raw
    (system-промпт _SYSTEM_PROMPT_RETELL передаётся напрямую, без глобального
    состояния — раньше это делалось через несработавшую подмену config.SYSTEM_PROMPT).
-4a. _validate_summary_fast: regex проверяет язык, отсутствие смешения скриптов,
-    непереведённые фрагменты.
+   Пересказ формируется на АНГЛИЙСКОМ — независимо от языка источника.
+4a. _validate_summary_fast: regex + langdetect проверяют, что вывод
+    действительно английский, и отсутствие смешения скриптов.
 4b. _validate_topic_llm: LLM проверяет тематическую релевантность и чистоту
     темы ГОТОВОГО пересказа (а не только исходной статьи, см. _validate_topic_pre_llm).
     При провале 4b — берём следующую статью из того же регионального пула,
     пока не найдём подходящую.
-5. build_digest() -> .docx.
-6. send_document() -> Telegram.
-7. Очистка старых строк: DELETE WHERE fetch_date < now-8.
+5. Локальный перевод английского пересказа на русский (translate_ru.translate_doc,
+   тот же движок opus-mt-tc-big-en-zle, что и в /opt/gdelt_rss) — после
+   _postprocess_digest, чтобы дедуп дубликатов события считался по стабильному
+   английскому тексту, а не по возможно разошедшимся переводам.
+6. build_digest() -> .docx.
+7. send_document() -> Telegram.
+8. Очистка старых строк: DELETE WHERE fetch_date < now-8.
 
 MMR-формула (lambda=0.5):
 score(d) = lambda * importance(d) - (1-lambda) * max_{s in S} sim(d, s)
@@ -64,13 +69,17 @@ import sqlite3
 import sys
 
 import numpy as np
+from langdetect import DetectorFactory, LangDetectException, detect
 
 import config
 import entities
 import importance
+import translate_ru
 from model_rotation import _call_openrouter_raw
 from word_generator import build_digest
 from telegram_sender import send_document
+
+DetectorFactory.seed = 0  # детерминированный langdetect, как в daily_collector.py
 
 # ---------------------------------------------------------------------------
 # Константы
@@ -404,43 +413,33 @@ def select_representatives(articles: list) -> tuple[list, dict]:
 # Системные промпты
 # ---------------------------------------------------------------------------
 _SYSTEM_PROMPT_RETELL = """\
-Retell the source article in Russian for an academic digest, in about 3–4 sentences.
-The source article may be in Turkish, English, Russian, or another language — \
+Retell the source article in English for an academic digest, in about 3–4 sentences.
+The source article may be in Turkish, Russian, English, or another language — \
 regardless of the source language, your ENTIRE output (both title and summary) \
-must be written in Russian, with the exceptions on proper names below.
+must be written in English. A separate local translation step converts this \
+English text to Russian afterwards, so keep all proper names in their normal \
+English/original spelling — do not transliterate anything.
 
 Rules:
 - Length: the summary must be about 3–4 sentences — concise, only the essential facts.
-- Names of PEOPLE and names of PLACES (cities, towns, settlements, regions, \
-countries) must be written in RUSSIAN, using their standard, established \
-Russian spelling — normal practice for Russian text, e.g. "Реджеп Тайип \
-Эрдоган" (not "Recep Tayyip Erdoğan"), "Ташкент" (not "Tashkent"), "Бишкек", \
-"Анкара".
-- Names of ORGANISATIONS, INSTITUTIONS, PROGRAMS, PROJECTS, laws/initiatives, \
-and similar proper names must be kept in their ORIGINAL LATIN-SCRIPT spelling — \
-copy them exactly as written in the source, do NOT translate or transliterate \
-them, e.g. "Tashkent State University", "Erasmus+", "TÜBİTAK".
-- Except for those Latin-script organisation/institution/program names, do not \
-leave ANY word, phrase, or clause untranslated in Turkish, English, or any \
-other language — translate everything else into Russian.
-- Russian grammar must be correct: gender, case, number, syntax.
+- Do not leave ANY word, phrase, or clause untranslated in Turkish, Russian, or any \
+other language — translate everything into English.
+- English grammar must be correct.
 - Do not invent facts.
 - Keep ONLY content related to science, education, youth policy in Turkey, Central Asia, South Caucasus, or external engagement involving Central Asia and South Caucasus. \
 If the source article also covers other, unrelated topics or events, SILENTLY DROP \
 them — do not summarize, mention, or even briefly reference the unrelated parts. \
 The final summary must read as if the unrelated content never existed in the source.
 - On first mention, expand abbreviations: full form first, then abbreviation in parentheses.
-- Do NOT mix Cyrillic and Latin characters inside individual words \
-(e.g. "аnализ" or "analиз" are forbidden).
 - ALWAYS make the geographic or institutional context explicit.
 - The title MUST explicitly indicate the place or institution the news is about, \
-for example: "В Турции ...", "В Узбекистане ...", "В Баку ...", \
-"В Tashkent State University ...", "В Министерстве образования Казахстана ...".
+for example: "In Turkey ...", "In Uzbekistan ...", "In Baku ...", \
+"At Tashkent State University ...", "Kazakhstan's Ministry of Education ...".
 - The summary MUST explicitly mention the place, country, city, institution, or \
 organisation the article is about in the first 1–2 sentences.
 
 Return ONLY valid JSON, no markdown fences:
-{"title": "<заголовок>", "summary": "<пересказ в 3–4 предложения>"}
+{"title": "<title>", "summary": "<3–4 sentence summary>"}
 """
 
 _SYSTEM_PROMPT_VALIDATE_TOPIC = """\
@@ -580,18 +579,9 @@ _MIXED_SCRIPT_RE = re.compile(
     r"|[a-zA-Z][а-яёА-ЯЁ][a-zA-Z]",
     flags=re.UNICODE,
 )
-_MIN_CYRILLIC_RATIO = 0.40
 
-# Две и более подряд идущих латинских слова СО СТРОЧНОЙ буквы — почти всегда
-# непереведённый обрывок исходного (турецкого/английского) текста, а не имя
-# собственное: имена и названия институтов копируются Title Case
-# ("Tashkent State University"), тогда как связный текст на другом языке
-# идёт строчными буквами ("üniversitede düzenlenen toplantıda").
-_LATIN_PHRASE_LEAK_RE = re.compile(
-    r"\b[a-z]{2,}\b(?:\s+[a-z]{2,}\b)+",
-    flags=re.UNICODE,
-)
-
+# ponytail: цена ложных срабатываний langdetect на коротком тексте (3-4
+# предложения) выше цены пропуска редкого нецелевого языка — fail-open.
 def _validate_summary_fast(result: dict) -> tuple[bool, str]:
     title   = result.get("title", "")
     summary = result.get("summary", "")
@@ -601,24 +591,22 @@ def _validate_summary_fast(result: dict) -> tuple[bool, str]:
         return False, "пустой title или summary"
 
     # Заголовок-обрубок: слабая модель иногда выдаёт только префикс-локацию
-    # ("В Турции", "В Казахстане:") без сути новости. Требуем минимум 3 значимых
-    # слова — иначе перевыбор модели/статьи (ловим и пустые "В стране" заголовки).
+    # ("In Turkey", "Uzbekistan:") без сути новости. Требуем минимум 3 значимых
+    # слова — иначе перевыбор модели/статьи.
     title_words = [w for w in re.findall(r"\w+", title, re.UNICODE) if len(w) > 1]
     if len(title_words) < 3:
         return False, f"заголовок-обрубок: «{title}»"
-
-    cyr   = len(re.findall(r"[а-яёА-ЯЁ]", full))
-    alpha = len(re.findall(r"[a-zA-Zа-яёА-ЯЁ]", full))
-    if alpha > 0 and cyr / alpha < _MIN_CYRILLIC_RATIO:
-        return False, f"мало кириллицы: {cyr}/{alpha} = {cyr/alpha:.2f}"
 
     m = _MIXED_SCRIPT_RE.search(full)
     if m:
         return False, f"смешение скриптов внутри слова: «{m.group()}»"
 
-    m = _LATIN_PHRASE_LEAK_RE.search(full)
-    if m:
-        return False, f"похоже на непереведённый фрагмент текста: «{m.group()}»"
+    try:
+        lang = detect(full)
+    except LangDetectException:
+        lang = None  # слишком коротко/неоднозначно — fail-open, не браковать
+    if lang is not None and lang != "en":
+        return False, f"пересказ не на английском (langdetect: {lang})"
 
     return True, "ok"
 
@@ -767,12 +755,12 @@ def _process_slot(
 # ---------------------------------------------------------------------------
 # Промпт для пост-обработки дайджеста
 # ---------------------------------------------------------------------------
-_SYSTEM_PROMPT_POSTPROCESS = """You are a quality-control editor for a Russian-language academic digest.
+_SYSTEM_PROMPT_POSTPROCESS = """You are a quality-control editor for an English-language academic digest.
 
 You will receive a JSON array of digest items. Each item has:
   "idx"     — original index (integer, preserve it),
-  "title"   — headline in Russian,
-  "summary" — body text in Russian.
+  "title"   — headline in English,
+  "summary" — body text in English.
 
 Apply ONE check and return a corrected JSON array:
 
@@ -850,6 +838,30 @@ def _postprocess_digest(summaries: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Локальный перевод английского пересказа на русский (translate_ru, тот же
+# движок opus-mt-tc-big-en-zle, что и /opt/gdelt_rss — см. translate_worker.py).
+# ---------------------------------------------------------------------------
+def _translate_to_russian(summaries: list[dict]) -> list[dict]:
+    result = []
+    for item in summaries:
+        try:
+            title_ru, summary_ru, _route = translate_ru.translate_doc(
+                item["title"], item["summary"])
+        except Exception:
+            log.exception("Перевод на русский упал для %s", item.get("url"))
+            continue
+        if title_ru is None or summary_ru is None:
+            log.warning("Перевод на русский не удался для %s — статья пропущена",
+                        item.get("url"))
+            continue
+        item["title"]   = title_ru
+        item["summary"] = summary_ru
+        result.append(item)
+    translate_ru.unload_all()
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Очистка старых данных
 # ---------------------------------------------------------------------------
 def cleanup_old(conn):
@@ -921,10 +933,17 @@ def main():
         if not summaries:
             log.error("После пост-обработки дайджест пуст.")
             return
-        
+
         for item in summaries:
             item.pop("embedding", None)
-        
+
+        summaries = _translate_to_russian(summaries)
+        log.info("После перевода на русский: %d", len(summaries))
+
+        if not summaries:
+            log.error("После перевода дайджест пуст.")
+            return
+
         docx_path = build_digest(summaries)
         log.info("Документ сохранён: %s", docx_path)
 

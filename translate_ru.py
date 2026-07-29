@@ -1,0 +1,1 @@
+/opt/gdelt_rss/translate_ru.py
