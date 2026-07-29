@@ -68,9 +68,10 @@ def test_slot_stops_at_first_candidate_when_llm_is_down():
         sp._call_openrouter_raw = orig
 
     assert result is None, "мёртвая LLM не может дать пересказ"
-    # Один кандидат: pre-check + MAX_RETRIES попыток пересказа. Раньше тут
-    # прожёвывался весь резерв (~40 кандидатов × те же вызовы).
-    budget = 1 + sp.MAX_RETRIES
+    # Один кандидат = MAX_RETRIES попыток пересказа, и всё: LLM-проверок темы
+    # больше нет (были ещё +1 pre-check на кандидата и +1 на каждую попытку).
+    # Раньше тут прожёвывался весь резерв (~40 кандидатов × те же вызовы).
+    budget = sp.MAX_RETRIES
     assert calls["n"] <= budget, (
         f"слот сжёг резерв вместо остановки: {calls['n']} вызовов, ожидалось <= {budget}"
     )

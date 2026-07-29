@@ -17,11 +17,14 @@ sunday_processor_mmr.py — воскресная обработка: отбор 
    состояния — раньше это делалось через несработавшую подмену config.SYSTEM_PROMPT).
    Пересказ формируется на АНГЛИЙСКОМ — независимо от языка источника.
 4a. _validate_summary_fast: regex + langdetect проверяют, что вывод
-    действительно английский, и отсутствие смешения скриптов.
-4b. _validate_topic_llm: LLM проверяет тематическую релевантность и чистоту
-    темы ГОТОВОГО пересказа (а не только исходной статьи, см. _validate_topic_pre_llm).
-    При провале 4b — берём следующую статью из того же регионального пула,
-    пока не найдём подходящую.
+    действительно английский, и отсутствие смешения скриптов. При провале —
+    берём следующую статью из того же регионального пула.
+    LLM-проверок темы здесь БОЛЬШЕ НЕТ: релевантность и регион статья получает
+    один раз, при сборе (daily_collector._JUDGE_SYSTEM), а два прежних
+    перепроверочных вызова (на сырой статье и на готовом пересказе) судили то же
+    самое теми же критериями — и оба были fail-open, т.е. при мёртвых провайдерах
+    молча пропускали всё. Стоили они по вызову на кандидата и по вызову на
+    попытку: 492 + ~500 обращений за прогон 2026-07-28 при квоте порядка тысячи.
 5. Локальный перевод английского пересказа на русский (translate_ru.translate_doc,
    тот же движок opus-mt-tc-big-en-zle, что и в /opt/gdelt_rss) — после
    _postprocess_digest, чтобы дедуп дубликатов события считался по стабильному
@@ -442,28 +445,6 @@ Return ONLY valid JSON, no markdown fences:
 {"title": "<title>", "summary": "<3–4 sentence summary>"}
 """
 
-_SYSTEM_PROMPT_VALIDATE_TOPIC = """\
-You are a relevance-check assistant for an academic digest.
-
-The digest covers ONLY the following topics:
-- Science, education, and youth policy IN Turkey, Central Asia \
-  (Kazakhstan, Uzbekistan, Kyrgyzstan, Tajikistan, Turkmenistan), \
-  or the South Caucasus (Georgia, Armenia, Azerbaijan).
-- Actions, policies, or initiatives OF the EU, USA, Iran, India, China, Japan, \
-  or South Korea directed AT Central Asia or the South Caucasus.
-
-Given a JSON with "title" and "summary" fields, decide whether the content \
-matches at least one of these topics, AND stays focused ONLY on such topics \
-throughout. If the item is mostly on-topic but also mentions, describes, or \
-drifts into an unrelated event or subject anywhere in the title or summary, \
-that counts as a FAIL — the digest must never mix in unrelated topics, even briefly.
-
-Respond ONLY with valid JSON, no markdown fences:
-{"ok": true}
-or
-{"ok": false, "reason": "<short explanation in English>"}
-"""
-
 _USER_PROMPT_RETELL_TEMPLATE = "Article URL: {url}\nArticle text:\n{text}"
 
 # ---------------------------------------------------------------------------
@@ -484,91 +465,6 @@ def _parse_llm_json(raw: str | None) -> dict | None:
     except json.JSONDecodeError as exc:
         log.warning("JSON parse error: %s | raw: %r", exc, raw[:200])
         return None
-
-# ---------------------------------------------------------------------------
-# Валидация темы — LLM (один вызов, только когда формат уже прошёл)
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Промпт для ПРЕДВАРИТЕЛЬНОЙ проверки темы — до пересказа, на сырой статье
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Промпты предварительной проверки темы (ДО пересказа)
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT_TOPIC_PRE_TR = """\
-You are a relevance-check assistant for an academic digest about Turkey.
-
-The digest accepts articles that cover ANY of the following topics \
-related to Turkey (Türkiye):
-- Science, research, universities, or academic institutions in Turkey.
-- Education policy, school reforms, curriculum, or student programs in Turkey.
-- Youth policy, youth organizations, or youth-related government programs in Turkey.
-- Turkish academic or educational cooperation with any foreign country.
-
-IMPORTANT: The article must be of NATIONAL significance — i.e. it concerns \
-state-level policy, major institutions, large-scale programs, or events with \
-nationwide impact. Reject local, municipal, or purely ceremonial news \
-(e.g. a single school event, a minor local award ceremony).
-
-The article may be in any language. Judge by content, not language.
-
-Respond ONLY with valid JSON, no markdown fences:
-{"ok": true}
-or
-{"ok": false, "reason": "<short explanation in English>"}
-"""
-
-_SYSTEM_PROMPT_TOPIC_PRE_INTL = """\
-You are a relevance-check assistant for an academic digest.
-
-The digest accepts articles that cover ANY of the following topics:
-- Science, education, or youth policy IN Central Asia \
-(Kazakhstan, Uzbekistan, Kyrgyzstan, Tajikistan, Turkmenistan).
-- Science, education, or youth policy IN the South Caucasus \
-(Georgia, Armenia, Azerbaijan).
-- Actions, policies, or initiatives OF the EU, USA, Iran, India, China, Japan, \
-or South Korea directed AT Central Asia or the South Caucasus.
-
-IMPORTANT: The article must be of NATIONAL significance — i.e. it concerns \
-state-level policy, major institutions, large-scale programs, or events with \
-nationwide impact. Reject local, municipal, or purely ceremonial news \
-(e.g. a single school event, a minor local award ceremony).
-
-The article may be in any language. Judge by content, not language.
-
-Respond ONLY with valid JSON, no markdown fences:
-{"ok": true}
-or
-{"ok": false, "reason": "<short explanation in English>"}
-"""
-
-def _validate_topic_pre_llm(text: str, url: str, bucket: str) -> tuple[bool, str]:
-    """
-    Предварительная тематическая проверка на сыром тексте статьи.
-    Задаём вопрос явно в user-сообщении, чтобы модель не уходила в пересказ.
-    """
-    system = _SYSTEM_PROMPT_TOPIC_PRE_TR if bucket == "TR" else _SYSTEM_PROMPT_TOPIC_PRE_INTL
-    snippet = text.replace("\n", " ").strip()
-
-    # Формируем user-сообщение как явный вопрос, а не просто текст статьи
-    user_msg = (
-        "Does the following article match the digest topics? "
-        "Reply ONLY with JSON {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}.\n\n"
-        f"Article text:\n{snippet}"
-    )
-
-    raw    = _call_openrouter_raw(system, user_msg, ref_url=url)
-    parsed = _parse_llm_json(raw)
-    if parsed is None:
-        # Парс-фейл (LLM недоступна / вернула не-JSON) — это поломка валидатора, а
-        # не сигнал "не по теме". Пропускаем статью дальше (fail-open): её тему ещё
-        # раз проверит _validate_topic_llm на готовом пересказе.
-        log.warning("_validate_topic_pre_llm: ответ не распарсился для %s | raw=%r — пропускаем (fail-open)", url, str(raw)[:200])
-        return True, "pre-check недоступен — fail-open"
-    if parsed.get("ok") is True:
-        return True, "ok"
-    return False, parsed.get("reason", "LLM: тема не соответствует дайджесту")
-
 
 # ---------------------------------------------------------------------------
 # Валидация формата и языка пересказа — БЫСТРАЯ (regex, без LLM)
@@ -612,34 +508,9 @@ def _validate_summary_fast(result: dict) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# Валидация ГОТОВОГО пересказа на чистоту темы (LLM) — уже после пересказа,
-# т.к. модель-пересказчик иногда всё равно подмешивает лишнее из источника,
-# даже если сама статья была одобрена на этапе _validate_topic_pre_llm.
-# ---------------------------------------------------------------------------
-def _validate_topic_llm(result: dict, url: str) -> tuple[bool, str]:
-    payload = {"title": result.get("title", ""), "summary": result.get("summary", "")}
-    user_msg = (
-        "Does the following digest item match the digest topics, and does it stay "
-        "focused ONLY on those topics with no unrelated topics mixed in? "
-        "Reply ONLY with JSON {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}.\n\n"
-        + json.dumps(payload, ensure_ascii=False)
-    )
-    raw    = _call_openrouter_raw(_SYSTEM_PROMPT_VALIDATE_TOPIC, user_msg, ref_url=url)
-    parsed = _parse_llm_json(raw)
-    if parsed is None:
-        # Парс-фейл валидатора не должен ронять уже сгенерированный пересказ —
-        # это поломка проверки, а не доказательство "не по теме". Принимаем (fail-open).
-        log.warning("_validate_topic_llm: ответ не распарсился для %s | raw=%r — принимаем (fail-open)", url, str(raw)[:200])
-        return True, "topic-check недоступен — fail-open"
-    if parsed.get("ok") is True:
-        return True, "ok"
-    return False, parsed.get("reason", "LLM: тема пересказа не соответствует дайджесту")
-
-
-# ---------------------------------------------------------------------------
-# Пересказ одной статьи: LLM-пересказ + быстрая regex-валидация формата +
-# LLM-валидация чистоты темы готового пересказа.
-# Тематическая релевантность ИСХОДНОЙ статьи проверяется заранее, в _process_slot.
+# Пересказ одной статьи: LLM-пересказ + быстрая regex-валидация формата.
+# Тематическая релевантность статьи решена ещё при сборе (daily_collector),
+# здесь её не перепроверяем — см. п.4a в шапке модуля.
 # ---------------------------------------------------------------------------
 def _retell_article(url: str, text: str, pub_date: str, attempt_label: str) -> dict | None:
     user_msg = _USER_PROMPT_RETELL_TEMPLATE.format(url=url, text=text[:3000])
@@ -658,11 +529,6 @@ def _retell_article(url: str, text: str, pub_date: str, attempt_label: str) -> d
             log.warning(" %s попытка %d: %s", attempt_label, attempt, reason)
             continue
 
-        ok_topic, reason_topic = _validate_topic_llm(result, url)
-        if not ok_topic:
-            log.warning(" %s попытка %d: тема пересказа не прошла проверку (%s)", attempt_label, attempt, reason_topic)
-            continue
-
         result["url"]          = url
         result["publish_date"] = pub_date
         return result
@@ -672,8 +538,8 @@ def _retell_article(url: str, text: str, pub_date: str, attempt_label: str) -> d
 
 
 # ---------------------------------------------------------------------------
-# Обработка одного слота: сначала тема (pre-check), потом пересказ
-# При провале темы или формата — следующая статья из регионального MMR-резерва
+# Обработка одного слота: дедуп-проверка, затем пересказ.
+# При провале формата — следующая статья из регионального MMR-резерва
 # ---------------------------------------------------------------------------
 MAX_RESERVE_SCAN = 50
 
@@ -726,14 +592,6 @@ def _process_slot(
             log.warning(
                 " %s: пропуск %s как семантического дубликата (max_sim=%.4f) — берём следующую из корзины %s",
                 slot_label, url, max_sim, primary_bucket,
-            )
-            continue
-
-        ok_topic, reason_topic = _validate_topic_pre_llm(text, url, primary_bucket)
-        if not ok_topic:
-            log.warning(
-                " %s: тема не подходит для %s (%s) — берём следующую из корзины %s",
-                slot_label, url, reason_topic, primary_bucket,
             )
             continue
 
