@@ -125,6 +125,43 @@ ALLOWED_TG_USER_IDS = [
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ---------------------------------------------------------------------------
+# Секреты не должны попадать в логи. Исключения requests стрингуют полный URL
+# вместе с токеном (".../bot<ТОКЕН>/getUpdates"), поэтому обычный
+# log.error("...: %s", exc) утекал токен в bot_listener.log и в syslog.
+# Чистить каждый вызов log.* по отдельности бессмысленно — подменяем фабрику
+# записей: она глобальная, так что редактируется КАЖДАЯ запись любого логгера
+# в процессе, включая те, что появятся позже.
+# ---------------------------------------------------------------------------
+_SECRETS = [OPENROUTER_API_KEY, GROQ_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN]
+
+
+def _install_secret_redaction() -> None:
+    import logging
+
+    secrets = [s for s in _SECRETS if s and len(s) >= 8]
+    if not secrets:
+        return
+    original_factory = logging.getLogRecordFactory()
+
+    def factory(*args, **kwargs):
+        record = original_factory(*args, **kwargs)
+        try:
+            message = record.getMessage()
+        except Exception:
+            return record
+        cleaned = message
+        for secret in secrets:
+            cleaned = cleaned.replace(secret, "***REDACTED***")
+        if cleaned != message:
+            record.msg, record.args = cleaned, ()
+        return record
+
+    logging.setLogRecordFactory(factory)
+
+
+_install_secret_redaction()
+
+# ---------------------------------------------------------------------------
 # Фильтры сбора статей из GDELT GKG (15-минутные дампы). Индекс в списке =
 # query_index в БД. daily_collector.py прогоняет каждый фильтр по themes
 # (GDELT GKG theme-коды) и locations (двухбуквенные FIPS-коды стран:
