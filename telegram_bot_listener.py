@@ -89,39 +89,23 @@ def run_processor(chat_id):
             os.remove(LOCK_PATH)
 
 
-def may_run_commands(user_id):
-    """Ручной запуск разрешён только user_id из ALLOWED_TG_USER_IDS.
-
-    Проверяем именно отправителя (message.from.id), а не chat_id: в группе это
-    разные числа, и на chat_id проверка бы не сработала. Пустой список ->
-    разрешаем всем: не запираем владельца, если .env ещё не заполнен."""
-    if not config.ALLOWED_TG_USER_IDS:
-        return True
-    return user_id in config.ALLOWED_TG_USER_IDS
-
-
 def handle_update(update):
     """Регистрирует отправителя и обрабатывает одну команду из апдейта.
     /rundigest  — запускает обработку в фоновом потоке (не блокирует polling).
     /resetlock  — снимает LOCK_PATH вручную (на случай, если предыдущий
                   запуск завис и не снял лок сам).
-    Подписка открыта всем, но обе команды — только для ALLOWED_TG_USER_IDS:
-    /rundigest поднимает тяжёлый subprocess и тратит платные LLM-кредиты, а
-    /resetlock снимает лок, позволяя запустить их несколько параллельно."""
+    Обе команды открыты всем — так решил владелец (2026-07-29). Цена: любой,
+    кто нашёл бота, может поднять тяжёлый subprocess и потратить платные
+    LLM-кредиты, а /resetlock снимает лок и позволяет запустить их параллельно.
+    Ограничение по user_id было в коммите f944abe, если понадобится вернуть."""
     message = update.get("message", {})
     text = message.get("text", "")
     chat_id = message.get("chat", {}).get("id")
-    user_id = message.get("from", {}).get("id")
 
     if chat_id is not None:
         users_store.register_user(chat_id)
 
     if not text:
-        return
-
-    if text.startswith(("/rundigest", "/resetlock")) and not may_run_commands(user_id):
-        log.warning("Отклонена команда %r от user_id=%s", text.split()[0], user_id)
-        send_message(chat_id, "⛔ Команда доступна только владельцу бота.")
         return
 
     if text.startswith("/rundigest"):

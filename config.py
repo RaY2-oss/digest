@@ -99,15 +99,7 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 #        Скопировать его в .env строкой TELEGRAM_BOT_TOKEN=...
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-# 3a) ALLOWED_TG_USER_IDS — Telegram user_id, которым разрешён ручной запуск
-#     /rundigest. Задаётся в /opt/digest/.env строкой
-#     ALLOWED_TG_USER_IDS=123456789,987654321 (через запятую, свой user_id
-#     можно узнать у @userinfobot).
-ALLOWED_TG_USER_IDS = [
-    int(uid) for uid in os.environ.get("ALLOWED_TG_USER_IDS", "").split(",") if uid.strip()
-]
-
-# 3b) TELEGRAM_CHAT_ID — задаётся в /opt/digest/.env (не в этом файле).
+# 3) TELEGRAM_CHAT_ID — задаётся в /opt/digest/.env (не в этом файле).
 #    Как получить chat_id личного чата / группы / канала:
 #      Вариант А (личный чат):
 #        - Написать боту любое сообщение.
