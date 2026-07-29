@@ -99,6 +99,17 @@ def _is_weak(mid: str) -> bool:
     low = mid.lower()
     return any(bad in low for bad in WEAK_MODEL_BLOCKLIST)
 
+
+def _strip_think(content: str) -> str:
+    """reasoning-модели (qwen, glm…) оборачивают ответ в <think>…</think> прямо в
+    content — берём хвост после последнего закрывающего тега, парсер ждёт чистый
+    текст. Нужно на ВСЕХ путях: у OpenRouter в пуле те же reasoning-модели, и без
+    зачистки их ответ падал в _parse_llm_json, а вызывающий код списывал это на
+    «модель не справилась» и жёг ретрай."""
+    if "</think>" in content:
+        content = content.rsplit("</think>", 1)[-1]
+    return content.strip()
+
 # None = список ещё не тянули; [] = тянули, пусто/ошибка (повторно не дёргаем).
 _groq_pool = None
 _google_pool = None
@@ -281,7 +292,7 @@ def _openrouter_attempt(system_prompt: str, user_message: str, ref_url: str = ""
                 content = choices[0]["message"]["content"]
                 _promote(model_id)
                 _batches_processed += 1
-                return content.strip()
+                return _strip_think(content)
             except Exception as exc:
                 log.warning(
                     "_call_openrouter_raw не удалось разобрать ответ %s: %s",
@@ -427,12 +438,7 @@ def _openai_chat(url: str, api_key: str, model_id: str,
         if tag:
             _note_retry_after(tag, resp)
         raise ValueError(f"HTTP {resp.status_code}")
-    content = resp.json()["choices"][0]["message"]["content"]
-    # reasoning-модели (qwen, glm…) оборачивают ответ в <think>…</think> прямо в
-    # content — берём хвост после последнего закрывающего тега, парсер ждёт чистый текст.
-    if "</think>" in content:
-        content = content.rsplit("</think>", 1)[-1]
-    return content.strip()
+    return _strip_think(resp.json()["choices"][0]["message"]["content"])
 
 
 def _try_pool(models, url, api_key, system_prompt, user_message, tag) -> str | None:
