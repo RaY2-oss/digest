@@ -257,19 +257,28 @@ def judge_parallel(texts):
 # Embedding-модель (sentence-transformers), грузится один раз лениво.
 # ---------------------------------------------------------------------------
 def get_model():
+    """Движок эмбеддингов. С 2026-07 это embedder.py: onnxruntime напрямую,
+    без sentence-transformers и без torch.
+
+    Связка sentence-transformers 5.6 / optimum 2.1 при local_files_only=True
+    резолвила onnx/model.onnx в None и уходила конвертировать модель сама —
+    через torch, который на этом CPU (нет AVX) убивается ядром по SIGILL.
+    Прогон вис навсегда, держа ~2 ГБ. В /opt/gdelt_rss это уже случилось.
+
+    Вектора идентичны прежним (косинус 1.000000 на выборке из БД), так что
+    переиндексация не нужна. Старый путь сохранён как _get_model_st().
+    """
+    import embedder
+    return embedder.get_engine()
+
+
+def _get_model_st():
+    """НЕ ИСПОЛЬЗУЕТСЯ. Прежняя реализация, оставлена для отката.
+    Требует рабочего torch, которого на этом CPU нет."""
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
         log.info("Loading embedding model %s ...", config.EMBEDDING_MODEL)
-        # backend="onnx", а не torch: у процессора этого VPS (QEMU, только до
-        # sse4_2) нет ни AVX, ни AVX2, а MKL внутри torch+cpu всё равно
-        # выполняет VEX-инструкцию и ядро убивает процесс по SIGILL — без
-        # трейсбека, целиком. onnxruntime считает своей математикой (MLAS) с
-        # честной диспетчеризацией под старый CPU. Вектора совпадают с torch,
-        # поэтому уже сохранённые в БД эмбеддинги остаются сравнимыми и
-        # переиндексация не нужна. Тот же приём, что в /opt/gdelt_rss.
-        # local_files_only — см. тот же приём в /opt/gdelt_rss: модель в кэше,
-        # ~20 HEAD-запросов к huggingface.co на прогон не нужны.
         _model = SentenceTransformer(config.EMBEDDING_MODEL, backend="onnx",
                                      model_kwargs={"file_name": "onnx/model.onnx"},
                                      local_files_only=True)
@@ -596,6 +605,18 @@ def main():
                 if is_non_event_article(url, title, text):
                     marks.append((url, qi, "non_event", None))
                     continue
+                # GDELT для этих запросов сущностей почти не отдаёт: колонка
+                # entities в БД пустая на всех 3428 статьях. Достаём их сами
+                # по общему газеттиру (glossary: топонимы Азии и Африки,
+                # институты, персоналии) — тем же, что питает перевод.
+                if not (ents or "").strip():
+                    try:
+                        import glossary
+                        found = glossary.extract_entities(
+                            (title or "") + " " + (text or "")[:3000])
+                        ents = ";".join(found)
+                    except Exception:
+                        log.exception("извлечение сущностей не удалось")
                 cands.append((url, text, html_date or gkg_date, title, lang, ents))
             seen_store.mark(conn, marks, fetch_date)
             if not cands:
