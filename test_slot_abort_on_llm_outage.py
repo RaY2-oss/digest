@@ -21,7 +21,6 @@ import sunday_processor_mmr as sp
 def _dead_ring():
     """Провайдеры исчерпаны, бюджет ожидания израсходован: вызовы падают сразу."""
     mr._provider_dead_until.clear()
-    mr._provider_strikes.clear()
     mr._retry_after.clear()
     mr._wait_spent = mr.RING_WAIT_BUDGET
     for tag in mr._PROVIDERS:
@@ -80,7 +79,6 @@ def test_slot_stops_at_first_candidate_when_llm_is_down():
 def test_slot_still_scans_reserve_when_llm_is_alive():
     """Обратная сторона: пока LLM жива, отказ по статье по-прежнему берёт следующую."""
     mr._provider_dead_until.clear()
-    mr._provider_strikes.clear()
     mr._wait_spent = 0.0
     mr._has_key = lambda tag: True
     assert not mr.providers_exhausted()
