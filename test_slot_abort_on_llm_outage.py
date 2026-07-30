@@ -30,12 +30,16 @@ def _dead_ring():
 
 
 def _reserve(n):
-    """n кандидатов, попарно непохожих — дубликат-фильтр их не срежет."""
+    """n кандидатов-сюжетов, попарно непохожих — дубликат-фильтр их не срежет.
+
+    Формат тот же, что отдаёт _group_stories: статья плюс седьмым полем
+    список её версий."""
     out = []
     for i in range(n):
         emb = np.zeros(8, dtype=np.float32)
         emb[i % 8] = 1.0
-        out.append((f"https://example.com/a{i}", f"text {i}", emb, "2026-07-29"))
+        art = (f"https://example.com/a{i}", f"text {i}", emb, "2026-07-29", "TR", 0.0)
+        out.append(art + ([art],))
     return out
 
 
@@ -53,11 +57,7 @@ def test_slot_stops_at_first_candidate_when_llm_is_down():
         reserve = _reserve(40)
         first = reserve[0]
         result = sp._process_slot(
-            primary_url=first[0],
-            primary_text=first[1],
-            primary_emb=first[2],
-            primary_pub_date=first[3],
-            primary_bucket="TR",
+            primary=first,
             regional_reserves={"TR": reserve[1:]},
             processed_urls=set(),
             accepted_embeddings=[],
@@ -87,7 +87,7 @@ def test_slot_still_scans_reserve_when_llm_is_alive():
     sp._call_openrouter_raw = lambda *a, **kw: None  # ответа нет, но провайдеры живы
     orig_retell = sp._retell_article
 
-    def tracking(url, text, pub_date, label):
+    def tracking(url, versions, pub_date, label):
         seen.append(url)
         return None
 
@@ -96,11 +96,7 @@ def test_slot_still_scans_reserve_when_llm_is_alive():
         reserve = _reserve(6)
         first = reserve[0]
         result = sp._process_slot(
-            primary_url=first[0],
-            primary_text=first[1],
-            primary_emb=first[2],
-            primary_pub_date=first[3],
-            primary_bucket="TR",
+            primary=first,
             regional_reserves={"TR": reserve[1:]},
             processed_urls=set(),
             accepted_embeddings=[],

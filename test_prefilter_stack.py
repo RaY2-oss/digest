@@ -127,6 +127,38 @@ def test_seen_store_verdicts():
         os.unlink(path)
 
 
+def test_prefiltered_never_becomes_training_data():
+    """Вердикт предфильтра не должен возвращаться к нему же как разметка.
+
+    Иначе каждое переобучение подтверждает прошлые решения модели, и отбор
+    съезжает всё уже — а заметить это по логам нечем: цифры полноты считаются
+    по той же отравленной выборке."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    conn = sqlite3.connect(path)
+    try:
+        seen_store.ensure(conn)
+        emb = np.ones(4, dtype=np.float32)
+        seen_store.mark(conn, [("http://p", 0, "prefiltered", None),
+                               ("http://r", 0, "rejected", emb)], "2026-07-30")
+
+        # Окончателен — повторно скачивать и судить URL не будем.
+        assert seen_store.final_urls(conn, ["http://p"]) == {"http://p"}
+        # Но в обучающую выборку не попадает: у строки нет эмбеддинга.
+        assert seen_store.label_counts(conn) == (0, 1), seen_store.label_counts(conn)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM seen_urls WHERE verdict='prefiltered' "
+            "AND embedding IS NOT NULL").fetchone()[0] == 0
+        # И через SEEN_KEEP_DAYS убирается, как прочие служебные вердикты.
+        conn.execute("UPDATE seen_urls SET last_seen='2020-01-01'")
+        conn.commit()
+        assert seen_store.prune(conn, 30) == 1
+        print("seen_store: вердикт предфильтра не отравляет обучение — OK")
+    finally:
+        conn.close()
+        os.unlink(path)
+
+
 def demo():
     test_offsets_parse()
     test_theme_must_be_near_country()
@@ -135,6 +167,7 @@ def demo():
     test_v2_absent_falls_back()
     test_cluster_duplicates()
     test_seen_store_verdicts()
+    test_prefiltered_never_becomes_training_data()
 
 
 if __name__ == "__main__":

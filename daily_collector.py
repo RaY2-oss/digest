@@ -180,6 +180,10 @@ _JUDGE_USER_TMPL = (
 
 JUDGE_TEXT_CHARS = 2000   # сколько символов статьи уходит в промпт
 JUDGE_BATCH = LLM_FILTER_BATCH
+
+# Маркер «решил предфильтр, а не LLM». Отдельный объект, а не строка "NO",
+# чтобы вердикт нельзя было спутать с ответом судьи ни здесь, ни в журнале.
+_PREFILTERED = object()
 _VERDICTS = ("NO", "TR", "CA", "SC", "MIX")
 
 
@@ -651,7 +655,9 @@ def main():
                          len(auto_drop), len(to_llm))
 
             # 7) LLM: релевантность и регион одним вызовом.
-            verdicts = {i: "NO" for i in auto_drop}
+            #    У предфильтрованных вердикт СВОЙ, не "NO": их решение приняла
+            #    модель, которая учится на этой же разметке (см. seen_store).
+            verdicts = {i: _PREFILTERED for i in auto_drop}
             if to_llm:
                 log.info("Query #%d: %d судейств -> ~%d запросов (батч %d)",
                          qi, len(to_llm), -(-len(to_llm) // JUDGE_BATCH), JUDGE_BATCH)
@@ -663,6 +669,8 @@ def main():
                 v = verdicts.get(reps[labels[i]])
                 if v is None:
                     marks.append((url, qi, "pending", None))
+                elif v is _PREFILTERED:
+                    marks.append((url, qi, "prefiltered", None))
                 elif v == "NO":
                     marks.append((url, qi, "rejected", embs[i]))
                 else:
@@ -673,10 +681,11 @@ def main():
             for k in range(0, len(batch), BATCH_SIZE):
                 total_new += flush_batch(conn, batch[k:k + BATCH_SIZE])
 
-            log.info("Query #%d: принято %d, отклонено %d, в pending %d",
+            log.info("Query #%d: принято %d, отклонено %d, предфильтр %d, в pending %d",
                      qi,
                      sum(1 for m in marks if m[2] == "accepted"),
                      sum(1 for m in marks if m[2] == "rejected"),
+                     sum(1 for m in marks if m[2] == "prefiltered"),
                      sum(1 for m in marks if m[2] == "pending"))
 
         log.info("=== Done. Total new articles: %d ===", total_new)

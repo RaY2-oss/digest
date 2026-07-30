@@ -77,6 +77,7 @@ from langdetect import DetectorFactory, LangDetectException, detect
 import config
 import entities
 import importance
+import prefilter
 import translate_ru
 from model_rotation import _call_openrouter_raw, providers_exhausted
 from word_generator import build_digest
@@ -226,32 +227,85 @@ def _lexrank_scores(
     return scores
 
 
-def _importance(subset: list, embeddings: np.ndarray) -> np.ndarray:
-    """Важность статей корзины в [0, 1]: LexRank + политический вес.
+def _versions(art: tuple) -> list:
+    """Все версии сюжета: [(url, text, ...), ...]. У несгруппированной
+    статьи — она сама, поэтому вызывать можно на чём угодно."""
+    return art[6] if len(art) > 6 else [art]
 
-    LexRank нормализуется в [0,1] и смешивается с уже посчитанным при загрузке
-    политическим весом статьи (subset[i][5], см. load_week_articles):
 
-        importance = (1 - W) * lexrank + W * политический_вес,  W = ENTITY_WEIGHT
+def _group_stories(subset: list) -> list:
+    """Почти-дубликаты одной новости -> один сюжет.
 
-    Если фактор выключен (W=0) или по корзине нет ни одного заметного субъекта,
-    возвращается чистый LexRank — прежнее поведение.
+    Раньше каждая перепечатка шла в отбор отдельным кандидатом. Это стоило
+    дважды: MMR мог отдать половину квоты шести зеркалам одной ленты, а
+    «сколько редакций вообще написали о событии» — сильнейший бесплатный
+    признак масштаба — нигде не учитывалось, хотя кластеры считались и
+    выбрасывались. Теперь сюжет идёт одной записью, а список его версий
+    едет седьмым полем: он даёт охват для _importance и тексты для пересказа.
+
+    Представителем берём САМЫЙ ДЛИННЫЙ текст: по нему и эмбеддинг честнее,
+    и пересказ полнее, если остальные версии не влезут в промпт.
     """
-    rel = _lexrank_scores(embeddings,
-                          domains=[importance.domain(a[0]) for a in subset])
-    r_min, r_max = float(rel.min()), float(rel.max())
-    if r_max - r_min > 1e-12:
-        rel = (rel - r_min) / (r_max - r_min)
-    else:
-        rel = np.full_like(rel, 0.5)
+    if len(subset) <= 1:
+        return [tuple(a) + (list(subset),) for a in subset]
 
-    w = config.ENTITY_WEIGHT
-    if w <= 0:
-        return rel
-    prom = np.array([a[5] for a in subset], dtype=np.float64)
-    if not prom.any():
-        return rel
-    return (1.0 - w) * rel + w * prom
+    # ponytail: жадная однопроходная кластеризация, O(n^2) по схожести.
+    # Корзина — до ~2 тыс. статей, это секунды; если вырастет на порядок,
+    # менять на LSH/faiss, а не подкручивать порог.
+    E = np.vstack([a[2] for a in subset]).astype(np.float32)
+    E /= np.linalg.norm(E, axis=1, keepdims=True) + 1e-10
+    label = np.full(len(subset), -1)
+    n_lab = 0
+    for i in range(len(subset)):
+        if label[i] >= 0:
+            continue
+        label[(E @ E[i] >= config.STORY_COSINE) & (label < 0)] = n_lab
+        n_lab += 1
+
+    stories = []
+    for k in range(n_lab):
+        members = [subset[i] for i in np.flatnonzero(label == k)]
+        members.sort(key=lambda a: len(a[1] or ""), reverse=True)
+        stories.append(tuple(members[0]) + (members,))
+    return stories
+
+
+def _importance(subset: list, embeddings: np.ndarray) -> np.ndarray:
+    """Важность сюжетов корзины в [0, 1] — четыре фактора, без LLM.
+
+        lexrank  — тематическая центральность в недельном окне;
+        coverage — сколько РАЗНЫХ изданий написали о сюжете;
+        entity   — политический вес субъектов (см. entities.py);
+        topic    — вероятность локального предфильтра «это наша тема».
+
+    Веса — в config.IMPORTANCE_W_*; ноль выключает фактор. Фактор topic
+    выключается сам, пока артефакт предфильтра не обучен.
+
+    Почему одного LexRank было мало: он меряет плотность связей, а корзина
+    на 40% состоит из однотипных заметок «школьник сдал экзамен» из разных
+    городов — они образуют такую же плотную клику, как настоящий сюжет, и
+    заметка про одну школу в Кадыкёе получала важность 0.966.
+    """
+    lex = importance.minmax(_lexrank_scores(
+        embeddings, domains=[importance.domain(a[0]) for a in subset]))
+
+    cov = np.array([importance.coverage_weight(
+        importance.distinct_domains(v[0] for v in _versions(a)),
+        config.COVERAGE_FULL_AT) for a in subset], dtype=np.float64)
+
+    ent = np.array([max(v[5] for v in _versions(a)) for a in subset],
+                   dtype=np.float64)
+    w_ent = config.IMPORTANCE_W_ENTITY if ent.any() else 0.0
+
+    factors = [(config.IMPORTANCE_W_LEXRANK, lex),
+               (config.IMPORTANCE_W_COVERAGE, cov),
+               (w_ent, ent)]
+
+    p = prefilter.score(config.PREFILTER_PATH, embeddings)
+    if p is not None:
+        factors.append((config.IMPORTANCE_W_TOPIC, importance.pct_rank(p)))
+
+    return importance.blend(factors)
 
 
 def _max_cosine_to_selected(emb: np.ndarray, selected_embs: list[np.ndarray]) -> float:
@@ -378,13 +432,21 @@ def select_representatives(articles: list) -> tuple[list, dict]:
     selected_urls: set[str] = set()
 
     for key, quota in QUOTA.items():
-        picked = _mmr_pick(buckets[key], quota)
+        stories = _group_stories(buckets[key])
+        log.info(" [%s] %d статей -> %d сюжетов (порог %.2f)",
+                 key, len(buckets[key]), len(stories), config.STORY_COSINE)
+        picked = _mmr_pick(stories, quota)
         log.info(" [%s] выбрано %d / квота %d", key, len(picked), quota)
         result.extend(picked)
-        picked_urls = {p[0] for p in picked}
+        # Занятыми считаются ВСЕ версии выбранного сюжета, а не только
+        # представитель: иначе его же перепечатка вернётся из резерва как
+        # «другая статья».
+        picked_urls = {v[0] for p in picked for v in _versions(p)}
         selected_urls.update(picked_urls)
-        # Остаток корзины → региональный резерв для замен, по важности
-        leftover_bucket = [a for a in buckets[key] if a[0] not in picked_urls]
+        # Остаток корзины → региональный резерв для замен, по важности.
+        # Резерв тоже из сюжетов: замена приходит со своими версиями для
+        # пересказа, как и основной кандидат.
+        leftover_bucket = [s for s in stories if s[0] not in picked_urls]
         regional_reserves[key] = _rank_by_importance(leftover_bucket)
 
     leftover_mix = [a for a in buckets["MIX"] if a[0] not in selected_urls]
@@ -405,9 +467,9 @@ def select_representatives(articles: list) -> tuple[list, dict]:
             if len(all_leftover) > DEFICIT_POOL_CAP:
                 all_leftover = random.sample(all_leftover, DEFICIT_POOL_CAP)
             log.info("Дефицит %d статей, добираем из leftover+MIX (%d)", deficit, len(all_leftover))
-            extra = _mmr_pick(all_leftover, deficit)
+            extra = _mmr_pick(_group_stories(all_leftover), deficit)
             result.extend(extra)
-            selected_urls.update(p[0] for p in extra)
+            selected_urls.update(v[0] for p in extra for v in _versions(p))
 
     log.info("Выбрано представителей: %d", len(result))
     return result, regional_reserves
@@ -440,12 +502,34 @@ for example: "In Turkey ...", "In Uzbekistan ...", "In Baku ...", \
 "At Tashkent State University ...", "Kazakhstan's Ministry of Education ...".
 - The summary MUST explicitly mention the place, country, city, institution, or \
 organisation the article is about in the first 1–2 sentences.
+- You may receive SEVERAL versions of the SAME story, filed by different outlets \
+and separated by a line of dashes. They are one news event, not several. Merge \
+them into ONE summary: use a fact if any version reports it, and where versions \
+disagree prefer the one reported by more of them. Never present them as separate \
+items and never invent a link between them that no version states.
 
 Return ONLY valid JSON, no markdown fences:
 {"title": "<title>", "summary": "<3–4 sentence summary>"}
 """
 
 _USER_PROMPT_RETELL_TEMPLATE = "Article URL: {url}\nArticle text:\n{text}"
+
+
+def _retell_sources(versions: list) -> str:
+    """Тексты версий сюжета в один промпт, под общим потолком по символам.
+
+    Разные редакции сохраняют разные детали (цифры, имена, цитаты), поэтому
+    пересказ по нескольким версиям полнее. Потолки — из config: одна версия
+    получает столько же символов, сколько получала раньше единственная
+    статья, дальше бюджет делится, чтобы промпт не вылезал из контекста
+    бесплатных моделей.
+    """
+    versions = versions[:config.RETELL_MAX_VERSIONS]
+    per = min(config.RETELL_CHARS_PER_VERSION,
+              config.RETELL_CHARS_TOTAL // len(versions))
+    return "\n\n----------\n\n".join(
+        _USER_PROMPT_RETELL_TEMPLATE.format(url=v[0], text=(v[1] or "")[:per])
+        for v in versions)
 
 # ---------------------------------------------------------------------------
 # Вспомогательный парсер JSON из ответа LLM
@@ -512,8 +596,11 @@ def _validate_summary_fast(result: dict) -> tuple[bool, str]:
 # Тематическая релевантность статьи решена ещё при сборе (daily_collector),
 # здесь её не перепроверяем — см. п.4a в шапке модуля.
 # ---------------------------------------------------------------------------
-def _retell_article(url: str, text: str, pub_date: str, attempt_label: str) -> dict | None:
-    user_msg = _USER_PROMPT_RETELL_TEMPLATE.format(url=url, text=text[:3000])
+def _retell_article(url: str, versions: list, pub_date: str, attempt_label: str) -> dict | None:
+    user_msg = _retell_sources(versions)
+    urls = [v[0] for v in versions[:config.RETELL_MAX_VERSIONS]]
+    if len(urls) > 1:
+        log.info(" %s: пересказ по %d версиям сюжета", attempt_label, len(urls))
 
     for attempt in range(1, MAX_RETRIES + 1):
         log.info(" %s попытка %d/%d: %s", attempt_label, attempt, MAX_RETRIES, url)
@@ -530,6 +617,7 @@ def _retell_article(url: str, text: str, pub_date: str, attempt_label: str) -> d
             continue
 
         result["url"]          = url
+        result["urls"]         = urls      # все источники, попавшие в промпт
         result["publish_date"] = pub_date
         return result
 
@@ -544,25 +632,21 @@ def _retell_article(url: str, text: str, pub_date: str, attempt_label: str) -> d
 MAX_RESERVE_SCAN = 50
 
 def _process_slot(
-    primary_url: str,
-    primary_text: str,
-    primary_emb: np.ndarray,
-    primary_pub_date: str,
-    primary_bucket: str,
+    primary: tuple,
     regional_reserves: dict,
     processed_urls: set,
     accepted_embeddings: list[np.ndarray],
     slot_label: str,
 ) -> dict | None:
     scanned = 0
+    primary_bucket = primary[4]
 
-    candidates = [(primary_url, primary_text, primary_emb, primary_pub_date)]
-    for item in regional_reserves.get(primary_bucket, []):
-        r_url, r_text, r_emb, r_pub_date = item[:4]
-        if r_url not in processed_urls:
-            candidates.append((r_url, r_text, r_emb, r_pub_date))
+    candidates = [primary]
+    candidates.extend(item for item in regional_reserves.get(primary_bucket, [])
+                      if item[0] not in processed_urls)
 
-    for url, text, emb, pub_date in candidates:
+    for cand in candidates:
+        url, _text, emb, pub_date = cand[:4]
         if scanned >= MAX_RESERVE_SCAN:
             log.warning(
                 " %s: достигнут лимит сканирования %d — слот остаётся пустым.",
@@ -595,7 +679,7 @@ def _process_slot(
             )
             continue
 
-        result = _retell_article(url, text, pub_date, slot_label)
+        result = _retell_article(url, _versions(cand), pub_date, slot_label)
         if result is None:
             # Провал пересказа при мёртвых провайдерах — это не "статья плохая",
             # а "LLM недоступна". Перебор резерва в таком состоянии просто
@@ -762,19 +846,15 @@ def main():
         accepted_embeddings: list[np.ndarray] = []
         target = config.N_CLUSTERS
 
-        for url, text, emb, pub_date, bucket, _prom in reps:
+        for rep in reps:
             if len(summaries) >= target:
                 break
-            if url in processed_urls:
+            if rep[0] in processed_urls:
                 continue
 
             slot_label = f"[{len(summaries)+1}/{target}]"
             result = _process_slot(
-                primary_url=url,
-                primary_text=text,
-                primary_emb=emb,
-                primary_pub_date=pub_date,
-                primary_bucket=bucket,
+                primary=rep,
                 regional_reserves=regional_reserves,
                 processed_urls=processed_urls,
                 accepted_embeddings=accepted_embeddings,

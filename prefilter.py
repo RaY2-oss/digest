@@ -6,6 +6,10 @@
 (дистилляция дорогого судьи в дешёвого). Обучение — в train_prefilter.py,
 здесь только применение.
 
+Та же модель работает и на воскресном отборе: score() отдаёт вероятность как
+непрерывную меру тематичности, четвёртый фактор важности сюжета
+(см. config.IMPORTANCE_W_TOPIC). Обучение одно, применений два.
+
 Порог один, нижний: p < lo — отбрасываем без LLM, всё остальное уходит в LLM.
 Верхнего порога намеренно нет. Он экономил бы мало (положительных всего ~13%
 потока), но лишал бы статью региональной метки TR/CA/SC/MIX, которую ставит
@@ -52,17 +56,29 @@ def is_ready(path) -> bool:
     return _load(path) is not None
 
 
-def drop_mask(path, embeddings):
-    """-> булев массив: True = отбросить, не тратя LLM-запрос."""
+def score(path, embeddings):
+    """-> вероятность «это наша тема» для каждого эмбеддинга, либо None.
+
+    Тот же артефакт используется дважды: здесь — как непрерывная мера
+    тематичности при ранжировании сюжетов (sunday_processor_mmr), в
+    drop_mask — как гейт перед LLM. Модель одна, обучение одно.
+    """
     n = len(embeddings)
     b = _load(path)
     if b is None or n == 0:
-        return np.zeros(n, dtype=bool)
+        return None
     X = np.asarray(embeddings, dtype=np.float32)
     X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-10)
     try:
-        p = b["clf"].predict_proba(X)[:, 1]
+        return b["clf"].predict_proba(X)[:, 1]
     except Exception as exc:
-        log.warning("Предфильтр упал на предсказании (%s) — пропускаем всех в LLM", exc)
-        return np.zeros(n, dtype=bool)
-    return p < b["lo"]
+        log.warning("Предфильтр упал на предсказании (%s)", exc)
+        return None
+
+
+def drop_mask(path, embeddings):
+    """-> булев массив: True = отбросить, не тратя LLM-запрос."""
+    p = score(path, embeddings)
+    if p is None:
+        return np.zeros(len(embeddings), dtype=bool)
+    return p < _load(path)["lo"]

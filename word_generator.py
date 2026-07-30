@@ -52,7 +52,9 @@ def _add_horizontal_rule(paragraph):
 
 def build_digest(summaries):
     """
-    summaries — список словарей {"title","summary","url","publish_date"}.
+    summaries — список словарей {"title","summary","url","publish_date"}
+    и необязательный "urls" — все источники сюжета, по которым сделан
+    пересказ (перепечатки одной новости в разных изданиях).
     publish_date — строка "YYYY-MM-DD" или None.
     """
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
@@ -75,7 +77,7 @@ def build_digest(summaries):
     for i, item in enumerate(summaries, start=1):
         title        = item.get("title", "Без заголовка")
         summary      = item.get("summary", "")
-        url          = item.get("url", "")
+        urls         = item.get("urls") or [item.get("url", "")]
         publish_date = item.get("publish_date") or ""
 
         # Заголовок: "N. дд.мм.гггг — Текст заголовка"
@@ -99,10 +101,15 @@ def build_digest(summaries):
         r_sum = p_sum.add_run(summary)
         r_sum.font.size = Pt(11)
 
-        p_url = doc.add_paragraph()
-        r_url = p_url.add_run(f"URL: {url}")
-        r_url.italic = True
-        r_url.font.size = Pt(10)
+        # Источников может быть несколько: пересказ сюжета собирается по всем
+        # перепечаткам, попавшим в промпт, и все они должны быть проверяемы.
+        for n, u in enumerate(urls):
+            if not u:
+                continue
+            p_url = doc.add_paragraph()
+            r_url = p_url.add_run(f"{'URL' if n == 0 else '   '}: {u}")
+            r_url.italic = True
+            r_url.font.size = Pt(10)
 
         doc.add_paragraph()
 
