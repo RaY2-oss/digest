@@ -125,6 +125,17 @@ def _run_mode_label() -> str:
 # судит тот же текст по тем же критериям. Теперь один вызов отдаёт либо "NO",
 # либо код региона.
 #
+# Список отказов намеренно перечисляет конкретные жанры, а не просит «оценить
+# значимость». Прежняя формулировка «purely local/municipal/ceremonial» не
+# ловила самый частый класс шума: рутину ОДНОГО заведения, у которого актор
+# при этом национальный (министерство, госкомиссия). Проходной балл вуза,
+# график приёма, проводы школьной команды на олимпиаду — по формальным
+# признакам это не «местная новость», и судья говорил да. В тонких корзинах
+# CA/SC такие заметки потом занимали половину квоты: ранжирование их не
+# отсеивает — все четыре фактора важности меряют тематичность и охват, а не
+# масштаб события, и фактор topic даже поднимает их наверх, потому что текст
+# приёмной кампании — самый «канонично образовательный» в корзине.
+#
 # Формат ответа — ОБЪЕКТ {"1":"CA","2":"NO"}, а не позиционный массив. Массив
 # ломался незаметно: модель теряла или добавляла элемент, индексы съезжали, и
 # вердикт доставался чужой статье. С номерами-ключами съехать нельзя, а
@@ -149,12 +160,28 @@ _JUDGE_SYSTEM = (
     "foreign-policy statement with no science/education/youth substance does "
     "NOT count, even if it involves these same countries.\n"
     "\n"
+    "A relevant article has a national actor or a national effect: a law or a "
+    "reform, a state programme or its funding, a new university, campus, "
+    "laboratory or research centre, published research results, an "
+    "intergovernmental agreement, national statistics, or a ranking or "
+    "assessment covering a country's universities as a whole. Such an article "
+    "stays IN even if it also mentions exams, enrolment or a ceremony.\n"
+    "\n"
     "Answer NO for an article if ANY of these apply:\n"
     "  - the topic is only mentioned in passing — not what the article is "
     "actually about;\n"
-    "  - the news is purely local/municipal/ceremonial (a single school event, "
-    "a minor local award, a routine press release) rather than of national or "
-    "large-scale significance;\n"
+    "  - it reports the ROUTINE OPERATION of a single school, university, "
+    "faculty or agency instead of a change of national scale: admission score "
+    "thresholds, enrolment and application schedules, exam-result "
+    "announcements, tuition or benefit terms, one institution's own curricula "
+    "and course offerings, staff appointments, anniversaries, graduations, "
+    "open days, seminars, trainings, courses, bootcamps and summer camps, or a "
+    "memorandum with nothing concrete behind it;\n"
+    "  - it is about pupils or students as individuals — a team leaving for or "
+    "preparing for an olympiad or a contest, personal prizes, medals and "
+    "congratulations, a scholarship awarded to named people;\n"
+    "  - the news is local/municipal/ceremonial, a minor award, a corporate "
+    "sponsorship or a press release with no policy or research substance;\n"
     "  - it's an opinion piece, interview, or analysis rather than a report of "
     "an actual event.\n"
     "\n"
