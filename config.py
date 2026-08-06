@@ -171,12 +171,15 @@ QUERIES_GKG = [
         # Из-за этого в БД попадала масса нерелевантного мусора ещё на этапе
         # дешёвого пред-фильтра, до полноценной LLM-проверки. Убраны —
         # реальную релевантность отсеивает LLM-фильтр (см. daily_collector.py).
+        #
+        # По той же причине убраны SOC_POINTSOFINTEREST_SCHOOL/UNIVERSITY/
+        # COLLEGE: это теги УПОМИНАНИЯ объекта, а не темы статьи — школа как
+        # место происшествия размечается ими так же, как школа как предмет
+        # реформы. Замер 30.07.2026: ни для одной из 607 строк недели такой тег
+        # не был единственной причиной прохода, то есть терять нечего.
         "themes": [
             "EDUCATION",
             "WB_470_EDUCATION",
-            "SOC_POINTSOFINTEREST_SCHOOL",
-            "SOC_POINTSOFINTEREST_UNIVERSITY",
-            "SOC_POINTSOFINTEREST_COLLEGE",
             "SCIENCE",
         ],
         "locations": ["TU", "KZ", "UZ", "TX", "KG", "TI", "GG", "AM", "AJ"],
