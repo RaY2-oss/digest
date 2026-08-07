@@ -15,20 +15,32 @@ sunday_processor_mmr.py — воскресная обработка: отбор 
 4. Для каждого слота из пула — пересказ через _call_openrouter_raw
    (system-промпт _SYSTEM_PROMPT_RETELL передаётся напрямую, без глобального
    состояния — раньше это делалось через несработавшую подмену config.SYSTEM_PROMPT).
-   Пересказ формируется на АНГЛИЙСКОМ — независимо от языка источника.
-4a. _validate_summary_fast: regex + langdetect проверяют, что вывод
-    действительно английский, и отсутствие смешения скриптов. При провале —
-    берём следующую статью из того же регионального пула.
+   Пересказ формируется СРАЗУ ПО-РУССКИ — независимо от языка источника.
+
+   Раньше он писался по-английски, а на русский его переводила локальная
+   opus-mt-tc-big-en-zle. Замер на шести живых статьях (07.08.2026) показал,
+   что плечо перевода не столько переводит, сколько портит: «восемь школьных
+   зданий будут усилены землетрясением» вместо «усилены НА СЛУЧАЙ
+   землетрясения», адрес портала İŞKUR, развалившийся на «Искур. Гоув. tr»,
+   и предложения по девяносто слов, потому что модель переводит фразу за
+   фразой и не умеет их разбивать. У пересказа сразу по-русски этих поломок
+   нет: тот же вызов LLM, но одним плечом вместо двух.
+
+   Что при этом потеряно, честно: латинские имена больше не проходят через
+   маркеры словаря нетронутыми, и модель иногда сама выбирает написание
+   («şehit» как «шейх»). Лечится списком принятых написаний в промпте, см.
+   _glossary_block.
+4a. _validate_summary_fast: regex проверяет формат, долю кириллицы и
+    отсутствие смешения скриптов. При провале — берём следующую статью из
+    того же регионального пула.
     LLM-проверок темы здесь БОЛЬШЕ НЕТ: релевантность и регион статья получает
     один раз, при сборе (daily_collector._JUDGE_SYSTEM), а два прежних
     перепроверочных вызова (на сырой статье и на готовом пересказе) судили то же
     самое теми же критериями — и оба были fail-open, т.е. при мёртвых провайдерах
     молча пропускали всё. Стоили они по вызову на кандидата и по вызову на
     попытку: 492 + ~500 обращений за прогон 2026-07-28 при квоте порядка тысячи.
-5. Локальный перевод английского пересказа на русский (translate_ru.translate_doc,
-   тот же движок opus-mt-tc-big-en-zle, что и в /opt/gdelt_rss) — после
-   _postprocess_digest, чтобы дедуп дубликатов события считался по стабильному
-   английскому тексту, а не по возможно разошедшимся переводам.
+5. _postprocess_digest — LLM-редактор снимает дубликаты одного события.
+   Отдельного шага перевода больше нет: п.4 уже отдаёт русский текст.
 6. build_digest() -> .docx.
 7. send_document() -> Telegram.
 8. Очистка старых строк: DELETE WHERE fetch_date < now-8.
@@ -72,18 +84,14 @@ import sqlite3
 import sys
 
 import numpy as np
-from langdetect import DetectorFactory, LangDetectException, detect
 
 import config
 import entities
 import importance
 import prefilter
-import translate_ru
 from model_rotation import _call_openrouter_raw, providers_exhausted
 from word_generator import build_digest
 from telegram_sender import send_document
-
-DetectorFactory.seed = 0  # детерминированный langdetect, как в daily_collector.py
 
 # ---------------------------------------------------------------------------
 # Константы
@@ -478,18 +486,26 @@ def select_representatives(articles: list) -> tuple[list, dict]:
 # Системные промпты
 # ---------------------------------------------------------------------------
 _SYSTEM_PROMPT_RETELL = """\
-Retell the source article in English for an academic digest, in about 3–4 sentences.
+Retell the source article in RUSSIAN for an academic digest, in about 3–4 sentences.
 The source article may be in Turkish, Russian, English, or another language — \
 regardless of the source language, your ENTIRE output (both title and summary) \
-must be written in English. A separate local translation step converts this \
-English text to Russian afterwards, so keep all proper names in their normal \
-English/original spelling — do not transliterate anything.
+must be written in natural, idiomatic Russian.
+
+Proper names:
+- Organisations, universities, programmes, portals and laws keep their original \
+Latin spelling (İŞKUR, TÜBİTAK, Erasmus+). Do not transliterate them.
+- Personal names, cities and regions use the established Russian form and are \
+inflected for case as Russian grammar requires.
+- When the established Russian form is not obvious, keep the Latin original \
+rather than inventing a transliteration.
 
 Rules:
 - Length: the summary must be about 3–4 sentences — concise, only the essential facts.
-- Do not leave ANY word, phrase, or clause untranslated in Turkish, Russian, or any \
-other language — translate everything into English.
-- English grammar must be correct.
+- Do not leave ANY word, phrase, or clause untranslated in Turkish, English, or any \
+other language — render everything in Russian.
+- Russian grammar, cases, agreement and word order must be correct and natural. \
+Do not calque English syntax: no chains of participles where a Russian writer \
+would use a subordinate clause, no strings of nouns in the genitive.
 - Do not invent facts.
 - Keep ONLY content related to science, education, youth policy in Turkey, Central Asia, South Caucasus, or external engagement involving Central Asia and South Caucasus. \
 If the source article also covers other, unrelated topics or events, SILENTLY DROP \
@@ -498,8 +514,9 @@ The final summary must read as if the unrelated content never existed in the sou
 - On first mention, expand abbreviations: full form first, then abbreviation in parentheses.
 - ALWAYS make the geographic or institutional context explicit.
 - The title MUST explicitly indicate the place or institution the news is about, \
-for example: "In Turkey ...", "In Uzbekistan ...", "In Baku ...", \
-"At Tashkent State University ...", "Kazakhstan's Ministry of Education ...".
+for example: "В Турции ...", "В Узбекистане ...", "В Баку ...", \
+"В Ташкентском государственном университете ...", \
+"Министерство просвещения Казахстана ...".
 - The summary MUST explicitly mention the place, country, city, institution, or \
 organisation the article is about in the first 1–2 sentences.
 - You may receive SEVERAL versions of the SAME story, filed by different outlets \
@@ -509,7 +526,7 @@ disagree prefer the one reported by more of them. Never present them as separate
 items and never invent a link between them that no version states.
 
 Return ONLY valid JSON, no markdown fences:
-{"title": "<title>", "summary": "<3–4 sentence summary>"}
+{"title": "<заголовок по-русски>", "summary": "<пересказ по-русски, 3–4 предложения>"}
 """
 
 _USER_PROMPT_RETELL_TEMPLATE = "Article URL: {url}\nArticle text:\n{text}"
@@ -527,9 +544,30 @@ def _retell_sources(versions: list) -> str:
     versions = versions[:config.RETELL_MAX_VERSIONS]
     per = min(config.RETELL_CHARS_PER_VERSION,
               config.RETELL_CHARS_TOTAL // len(versions))
-    return "\n\n----------\n\n".join(
+    body = "\n\n----------\n\n".join(
         _USER_PROMPT_RETELL_TEMPLATE.format(url=v[0], text=(v[1] or "")[:per])
         for v in versions)
+    return _glossary_block(body) + body
+
+
+def _glossary_block(text):
+    """Принятые написания имён, встретившихся в этом тексте, — в промпт.
+
+    Правило старое (glossary.py): к выводу LLM словарь НЕ применяется
+    постобработкой, она ломает падежи. Пока пересказ писался по-английски,
+    словарь был не нужен вовсе — имена шли латиницей, а русскую форму им потом
+    подбирал локальный переводчик. Теперь русскую форму выбирает сама модель, и
+    выбирает наугад: в замере она приняла турецкое şehit («павший», в названиях
+    школ и больниц) за «шейха». Список принятых написаний это чинит там же, где
+    возникает ошибка, и модель сама ставит нужный падеж.
+    """
+    try:
+        import glossary
+        block = glossary.as_prompt_block(text)
+    except Exception:
+        log.exception("Словарь имён не подгрузился — пересказ пойдёт без него")
+        return ""
+    return block + "\n\n" if block else ""
 
 # ---------------------------------------------------------------------------
 # Вспомогательный парсер JSON из ответа LLM
@@ -560,8 +598,23 @@ _MIXED_SCRIPT_RE = re.compile(
     flags=re.UNICODE,
 )
 
-# ponytail: цена ложных срабатываний langdetect на коротком тексте (3-4
-# предложения) выше цены пропуска редкого нецелевого языка — fail-open.
+# Доля кириллицы среди букв. Спрашиваем письменность, а не язык: вопрос здесь
+# ровно один — ответила модель по-русски или сорвалась в английский с турецким.
+# langdetect на 3–4 предложениях с латинскими названиями организаций отвечает то
+# «bg», то «mk», и его вердикт пришлось бы прощать так широко, что он перестал бы
+# что-либо значить. Порог низкий: в пересказе про İŞKUR и TÜBİTAK латиницы
+# законно много, а английский текст даёт ноль кириллицы, и промахнуться мимо
+# половины невозможно.
+_MIN_CYRILLIC = 0.5
+
+
+def _cyrillic_share(text: str) -> float:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 0.0
+    return sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in letters) / len(letters)
+
+
 def _validate_summary_fast(result: dict) -> tuple[bool, str]:
     title   = result.get("title", "")
     summary = result.get("summary", "")
@@ -581,12 +634,9 @@ def _validate_summary_fast(result: dict) -> tuple[bool, str]:
     if m:
         return False, f"смешение скриптов внутри слова: «{m.group()}»"
 
-    try:
-        lang = detect(full)
-    except LangDetectException:
-        lang = None  # слишком коротко/неоднозначно — fail-open, не браковать
-    if lang is not None and lang != "en":
-        return False, f"пересказ не на английском (langdetect: {lang})"
+    share = _cyrillic_share(full)
+    if share < _MIN_CYRILLIC:
+        return False, f"пересказ не на русском (кириллицы {share:.0%})"
 
     return True, "ok"
 
@@ -705,12 +755,14 @@ def _process_slot(
 # ---------------------------------------------------------------------------
 # Промпт для пост-обработки дайджеста
 # ---------------------------------------------------------------------------
-_SYSTEM_PROMPT_POSTPROCESS = """You are a quality-control editor for an English-language academic digest.
+_SYSTEM_PROMPT_POSTPROCESS = """You are a quality-control editor for a Russian-language academic digest.
 
 You will receive a JSON array of digest items. Each item has:
   "idx"     — original index (integer, preserve it),
-  "title"   — headline in English,
-  "summary" — body text in English.
+  "title"   — headline in Russian,
+  "summary" — body text in Russian.
+
+Keep every item in Russian. Do not translate, rewrite or "improve" the wording.
 
 Apply ONE check and return a corrected JSON array:
 
@@ -784,30 +836,6 @@ def _postprocess_digest(summaries: list[dict]) -> list[dict]:
         log.info("Пост-обработка: удалено %d дубликат(ов), осталось %d статей", len(removed), len(result))
     else:
         log.info("Пост-обработка: дубликатов не найдено, тексты исправлены")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Локальный перевод английского пересказа на русский (translate_ru, тот же
-# движок opus-mt-tc-big-en-zle, что и /opt/gdelt_rss — см. translate_worker.py).
-# ---------------------------------------------------------------------------
-def _translate_to_russian(summaries: list[dict]) -> list[dict]:
-    result = []
-    for item in summaries:
-        try:
-            title_ru, summary_ru, _route = translate_ru.translate_doc(
-                item["title"], item["summary"])
-        except Exception:
-            log.exception("Перевод на русский упал для %s", item.get("url"))
-            continue
-        if title_ru is None or summary_ru is None:
-            log.warning("Перевод на русский не удался для %s — статья пропущена",
-                        item.get("url"))
-            continue
-        item["title"]   = title_ru
-        item["summary"] = summary_ru
-        result.append(item)
-    translate_ru.unload_all()
     return result
 
 
@@ -886,13 +914,6 @@ def main():
 
         for item in summaries:
             item.pop("embedding", None)
-
-        summaries = _translate_to_russian(summaries)
-        log.info("После перевода на русский: %d", len(summaries))
-
-        if not summaries:
-            log.error("После перевода дайджест пуст.")
-            return
 
         docx_path = build_digest(summaries)
         log.info("Документ сохранён: %s", docx_path)
