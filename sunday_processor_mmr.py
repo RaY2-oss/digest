@@ -490,6 +490,8 @@ Retell the source article in RUSSIAN for an academic digest, in about 3–4 sent
 The source article may be in Turkish, Russian, English, or another language — \
 regardless of the source language, your ENTIRE output (both title and summary) \
 must be written in natural, idiomatic Russian.
+RUSSIAN means Russian specifically, NOT Ukrainian, Belarusian, Bulgarian or any \
+other Cyrillic language. Never mirror the language of the source article.
 
 Proper names:
 - Organisations, universities, programmes, portals and laws keep their original \
@@ -607,12 +609,37 @@ _MIXED_SCRIPT_RE = re.compile(
 # половины невозможно.
 _MIN_CYRILLIC = 0.5
 
+# Кириллица бывает не только русская, и одной доли кириллицы мало: 07.08.2026
+# в дайджест ушёл пункт целиком по-украински («У місті Тбілісі та Астані
+# розгорнуто інтенсивну підготовку...»). Общих букв в тексте подавляющее
+# большинство, доля кириллицы вышла 0.93 — верхний порог такое пропускает и
+# будет пропускать всегда.
+#
+# Ловим по буквам, которых в русском алфавите нет: украинские і/ї/є/ґ,
+# белорусская ў, сербские ђ/ћ/ј/љ/њ, казахские ә/ғ/қ/ң/ө/ұ/ү/һ.
+#
+# Порог не нулевой: имя в исходном написании посреди русского текста — ещё не
+# смена языка, а перевыбор стоит слота. Замер по всем 20 сохранённым дайджестам
+# (1717 абзацев) даёт два порядка зазора: у украинских абзацев 11% и 17%, у
+# худшего русского — 0.12% («министр просвещения Кыргызстана Догдуркүл
+# Кендирбаева», киргизская ү в одном имени). Порог стоит в этом промежутке.
+_RU_ALPHABET = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+_MAX_FOREIGN_CYRILLIC = 0.02
+
 
 def _cyrillic_share(text: str) -> float:
     letters = [c for c in text if c.isalpha()]
     if not letters:
         return 0.0
     return sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in letters) / len(letters)
+
+
+def _foreign_cyrillic_share(text: str) -> float:
+    """Доля нерусских кириллических букв среди кириллических."""
+    cyr = [c for c in text.lower() if "Ѐ" <= c <= "ӿ"]
+    if not cyr:
+        return 0.0
+    return sum(c not in _RU_ALPHABET for c in cyr) / len(cyr)
 
 
 def _validate_summary_fast(result: dict) -> tuple[bool, str]:
@@ -637,6 +664,11 @@ def _validate_summary_fast(result: dict) -> tuple[bool, str]:
     share = _cyrillic_share(full)
     if share < _MIN_CYRILLIC:
         return False, f"пересказ не на русском (кириллицы {share:.0%})"
+
+    foreign = _foreign_cyrillic_share(full)
+    if foreign > _MAX_FOREIGN_CYRILLIC:
+        return False, (f"пересказ на другом кириллическом языке "
+                       f"(нерусских букв {foreign:.0%})")
 
     return True, "ok"
 
