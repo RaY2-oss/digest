@@ -84,10 +84,65 @@ def test_mixed_script_inside_a_word_still_fails():
     assert not ok and "смешение" in why, why
 
 
+def test_third_script_is_rejected():
+    """Оба случая с боевого выхлопа. Арабский — замер 07.08.2026, слово
+    «организовал» модель собрала наполовину из исходного письма. Армянский
+    ушёл читателю в пункте 20 дайджеста от 25.07.2026. Прежний сторож ловил
+    только пару кириллица+латиница и оба пропустил."""
+    ok, why = spm._validate_summary_fast({
+        "title": _OK,
+        "summary": "Обучающий этап نظمил Министерство энергетики Турции.",
+    })
+    assert not ok and "третий алфавит" in why, why
+
+    ok, why = spm._validate_summary_fast({
+        "title": _OK,
+        "summary": "Правительство Армении передаст участок фонду "
+                   "«Գյումրիի տեղեկատվական տեխնոլոգիաների կենտրոն».",
+    })
+    assert not ok and "третий алфавит" in why, why
+
+
+def test_greek_letters_stay_allowed():
+    """Научный текст: β-распад и α-частицы — не поломка письма."""
+    ok, why = spm._validate_summary_fast({
+        "title": _OK,
+        "summary": "В лаборатории измерили β-распад и поток α-частиц.",
+    })
+    assert ok, why
+
+
+def test_truncated_summary_is_rejected():
+    """Потолок токенов ставит провайдер, и обрыв доезжает до читателя как
+    валидный JSON. Замер по 448 отгруженным пересказам: без концевой точки нет
+    ни одного, так что проверка не стоит ни одного слота."""
+    ok, why = spm._validate_summary_fast({
+        "title": _OK,
+        "summary": "Норма гарантирует сохранение личных выплат контрактных преподавателей",
+    })
+    assert not ok and "оборван" in why, why
+
+    ok, why = spm._validate_summary_fast(
+        {"title": _OK, "summary": "Работу примут осенью (по данным TÜBİTAK)."})
+    assert ok, why
+
+
 def test_cyrillic_share_ignores_digits_and_punctuation():
     assert spm._cyrillic_share("2026 — 30 000 (45 ₺)") == 0.0
     assert spm._cyrillic_share("") == 0.0
     assert spm._cyrillic_share("слово") == 1.0
+
+
+def test_abbreviation_glosses_reach_the_prompt():
+    """Модель не может расшифровать TENMAK, если ей не сказать, что это. Пояснения
+    едут четвёртой колонкой glossary_abbr.tsv; тест смотрит на весь путь до
+    промпта, потому что молчаливая потеря колонки выглядит ровно как «модель
+    поленилась»."""
+    src = spm._retell_sources([("https://x.example/1",
+                                "TENMAK ve NÜKEN, LGS ve YKS hakkında açıklama yaptı.")])
+    for term, gloss in [("TENMAK", "энергетик"), ("LGS", "лицей"), ("YKS", "вуз")]:
+        line = next((l for l in src.splitlines() if l.strip().startswith('"%s"' % term.lower())), "")
+        assert gloss in line, "нет пояснения для %s: %r" % (term, line)
 
 
 def test_glossary_block_does_not_eat_the_article_budget():
@@ -113,6 +168,10 @@ if __name__ == "__main__":
     test_ukrainian_output_is_rejected()
     test_one_foreign_name_does_not_cost_a_slot()
     test_mixed_script_inside_a_word_still_fails()
+    test_third_script_is_rejected()
+    test_greek_letters_stay_allowed()
+    test_truncated_summary_is_rejected()
+    test_abbreviation_glosses_reach_the_prompt()
     test_cyrillic_share_ignores_digits_and_punctuation()
     test_glossary_block_does_not_eat_the_article_budget()
     test_translation_leg_is_gone()

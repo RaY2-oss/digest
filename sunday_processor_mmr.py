@@ -82,6 +82,7 @@ import random
 import re
 import sqlite3
 import sys
+import unicodedata
 
 import numpy as np
 
@@ -486,7 +487,10 @@ def select_representatives(articles: list) -> tuple[list, dict]:
 # Системные промпты
 # ---------------------------------------------------------------------------
 _SYSTEM_PROMPT_RETELL = """\
-Retell the source article in RUSSIAN for an academic digest, in about 3–4 sentences.
+Retell the source article in RUSSIAN for an academic digest, in about 3–5 sentences.
+The reader follows science, education and youth policy but knows NOTHING about \
+this particular country's institutions, exams, agencies or political parties. \
+Write so that such a reader understands the news without looking anything up.
 The source article may be in Turkish, Russian, English, or another language — \
 regardless of the source language, your ENTIRE output (both title and summary) \
 must be written in natural, idiomatic Russian.
@@ -501,8 +505,25 @@ inflected for case as Russian grammar requires.
 - When the established Russian form is not obvious, keep the Latin original \
 rather than inventing a transliteration.
 
+Context for a newcomer:
+- On first mention, expand EVERY abbreviation and add, in the same sentence, a \
+short apposition saying what it is: "Совет по высшему образованию Турции (YÖK)", \
+"LGS, экзамен при переходе в лицей". Same for institutions, exams, programmes, \
+agencies, parties and rankings that only a specialist would recognise.
+- NEVER invent an expansion or a description. Use the "Established renderings" \
+block above and the source article, and nothing else. If neither says what an \
+abbreviation stands for, leave it as it is — a wrong expansion is far worse than \
+a missing one.
+- Do NOT explain what everybody knows: ООН, ЕС, США, НАТО, ЮНЕСКО, ВОЗ, GPS, \
+искусственный интеллект and the like go without a gloss.
+- Turkish abbreviations of countries and unions are NOT names and must be \
+rendered in Russian, not kept: AB -> ЕС, ABD -> США, BM -> ООН, TC -> Турция.
+- A gloss is an apposition or a subordinate clause inside an existing sentence, \
+never a separate explanatory sentence — the facts of the news must not lose room \
+to them.
+
 Rules:
-- Length: the summary must be about 3–4 sentences — concise, only the essential facts.
+- Length: the summary must be about 3–5 sentences — concise, only the essential facts.
 - Do not leave ANY word, phrase, or clause untranslated in Turkish, English, or any \
 other language — render everything in Russian.
 - Russian grammar, cases, agreement and word order must be correct and natural. \
@@ -513,7 +534,6 @@ would use a subordinate clause, no strings of nouns in the genitive.
 If the source article also covers other, unrelated topics or events, SILENTLY DROP \
 them — do not summarize, mention, or even briefly reference the unrelated parts. \
 The final summary must read as if the unrelated content never existed in the source.
-- On first mention, expand abbreviations: full form first, then abbreviation in parentheses.
 - ALWAYS make the geographic or institutional context explicit.
 - The title MUST explicitly indicate the place or institution the news is about, \
 for example: "В Турции ...", "В Узбекистане ...", "В Баку ...", \
@@ -528,7 +548,7 @@ disagree prefer the one reported by more of them. Never present them as separate
 items and never invent a link between them that no version states.
 
 Return ONLY valid JSON, no markdown fences:
-{"title": "<заголовок по-русски>", "summary": "<пересказ по-русски, 3–4 предложения>"}
+{"title": "<заголовок по-русски>", "summary": "<пересказ по-русски, 3–5 предложений>"}
 """
 
 _USER_PROMPT_RETELL_TEMPLATE = "Article URL: {url}\nArticle text:\n{text}"
@@ -626,12 +646,31 @@ _MIN_CYRILLIC = 0.5
 _RU_ALPHABET = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
 _MAX_FOREIGN_CYRILLIC = 0.02
 
+# Третий алфавит. Модель иногда вставляет кусок исходного письма прямо в
+# русское слово: «Обучающий этап نظمил Министерство энергетики» (замер
+# 07.08.2026), а 25.07.2026 читателю ушёл пункт с «фонду
+# «Գյումրիի տեղեկատվա...». Ни одно правило промпта такого не разрешает:
+# имена идут либо принятой русской формой, либо латиницей.
+#
+# Допуска здесь нет, в отличие от кириллицы: одна арабская буква посреди слова
+# — это уже сломанное слово, а не заимствованное написание. Греческий оставлен
+# белым: β-распад и α-частицы в научном тексте законны. Замер по 20 дайджестам
+# (1717 абзацев): ровно два попадания, оба — эта поломка.
+_SCRIPTS_OK = ("LATIN", "CYRILLIC", "GREEK")
+
 
 def _cyrillic_share(text: str) -> float:
     letters = [c for c in text if c.isalpha()]
     if not letters:
         return 0.0
     return sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in letters) / len(letters)
+
+
+def _third_script_letters(text: str) -> list:
+    """Буквы не из латиницы, кириллицы и греческого — в порядке появления."""
+    return [c for c in text
+            if c.isalpha()
+            and not unicodedata.name(c, "").startswith(_SCRIPTS_OK)]
 
 
 def _foreign_cyrillic_share(text: str) -> float:
@@ -660,6 +699,18 @@ def _validate_summary_fast(result: dict) -> tuple[bool, str]:
     m = _MIXED_SCRIPT_RE.search(full)
     if m:
         return False, f"смешение скриптов внутри слова: «{m.group()}»"
+
+    third = _third_script_letters(full)
+    if third:
+        return False, f"третий алфавит в тексте: «{''.join(third[:12])}»"
+
+    # Обрыв на полуслове. Потолок токенов запросу не задаётся, его ставит
+    # провайдер, и finish_reason до нас не доходит — _call_openrouter_raw
+    # отдаёт один текст. Зато обрыв виден по концу: JSON при этом остаётся
+    # валидным, поэтому парсер такое пропускает («...сохранение личных выплат
+    # контрактных преподавателей» — замер 07.08.2026).
+    if not re.search(r"[.!?…][»\"')\]]*$", summary.strip()):
+        return False, f"пересказ оборван: «...{summary.strip()[-40:]}»"
 
     share = _cyrillic_share(full)
     if share < _MIN_CYRILLIC:
