@@ -22,6 +22,17 @@ to repurpose this for a different beat.
    apart from `rejected` and stored *without* its embedding: that verdict came
    from the local classifier below, and feeding it back as training data would
    let the model confirm its own decisions run after run.
+
+   Pages that returned no usable text get one more chance at the end of the
+   run, from a real browser (`rescue_with_browser`, camoufox): `short` is final
+   on the first attempt, so it is now or never. Measured on 100 such URLs
+   (2026-08-08), counting only genuine articles: a plain `requests` retry 23,
+   `curl_cffi` with a Chrome TLS fingerprint 23, camoufox 32. At ~15 s/page the
+   browser stays out of the main fetch loop and is capped at
+   `config.CAMOUFOX_MAX` pages per run. `ANTIBOT_PATTERNS` in `extract_page`
+   keeps anti-bot interstitials out of the corpus — they are 300–500 characters
+   of prose, i.e. comfortably above `MIN_TEXT_LENGTH`, and shields answer a
+   browser more readily than a script.
 2. **LLM relevance/topic check** — via `model_rotation.py`, which rotates
    across OpenRouter's free-tier models, then falls back to Groq, then
    Google (Gemini), round-robin, with per-provider cooldown on exhaustion.
