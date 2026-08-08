@@ -67,10 +67,10 @@ def test_silence_goes_to_pending_not_reject():
 def test_partial_answer_only_missing_goes_pending():
     """Модель ответила не на все номера: недостающие в pending, прочие приняты."""
     real = dc._call_openrouter_raw
-    dc._call_openrouter_raw = lambda *a, **kw: '{"1": "CA", "3": "NO"}'
+    dc._call_openrouter_raw = lambda *a, **kw: '{"1": "CA2", "3": "NO"}'
     try:
         got = dc.judge_parallel(["a", "b", "c"])
-        assert got == ["CA", None, "NO"], got
+        assert got == [("CA", 2), None, ("NO", None)], got
     finally:
         dc._call_openrouter_raw = real
     print("judge_parallel: частичный ответ -> в pending только пропущенные — OK")
@@ -78,12 +78,22 @@ def test_partial_answer_only_missing_goes_pending():
 
 def test_object_format_cannot_shift_indices():
     """Ключи-номера не дают вердикту достаться чужой статье."""
-    assert dc._parse_judge('{"3":"TR","1":"NO","2":"MIX"}', 3) == ["NO", "MIX", "TR"]
+    assert dc._parse_judge('{"3":"TR3","1":"NO","2":"MIX2"}', 3) == [
+        ("NO", None), ("MIX", 2), ("TR", 3)]
     assert dc._parse_judge("вообще не json", 2) is None
-    assert dc._parse_judge('{"1":"BOGUS","2":"SC"}', 2) == [None, "SC"]
+    assert dc._parse_judge('{"1":"BOGUS","2":"SC1"}', 2) == [None, ("SC", 1)]
     # Позиционный массив раньше молча съезжал; теперь он просто не разбирается.
     assert dc._parse_judge('["NO","SC"]', 2) is None
     print("_parse_judge: формат-объект защищает от съезда индексов — OK")
+
+
+def test_verdict_without_a_digit_still_parses():
+    """Цифру масштаба модель ставит не всегда, и это не повод терять статью:
+    вердикт без цифры разбирается как раньше, масштаб — None (в ранжировании
+    такая статья идёт по середине шкалы, см. _story_scale)."""
+    assert dc._parse_judge('{"1":"TR","2":"CA 3","3":"SC4"}', 3) == [
+        ("TR", None), ("CA", 3), None]
+    print("_parse_judge: вердикт без цифры не теряется — OK")
 
 
 def demo():
@@ -91,6 +101,7 @@ def demo():
     test_silence_goes_to_pending_not_reject()
     test_partial_answer_only_missing_goes_pending()
     test_object_format_cannot_shift_indices()
+    test_verdict_without_a_digit_still_parses()
 
 
 if __name__ == "__main__":

@@ -133,7 +133,8 @@ LEXRANK_TOL = 1e-6
 # ---------------------------------------------------------------------------
 def load_week_articles(conn):
     rows = conn.execute(
-        "SELECT url, text, embedding, publish_date, region_bucket, entities FROM articles "
+        "SELECT url, text, embedding, publish_date, region_bucket, entities, scale "
+        "FROM articles "
         "WHERE ("
         " (publish_date IS NOT NULL AND publish_date >= date('now', '-7 days'))"
         " OR"
@@ -152,7 +153,8 @@ def load_week_articles(conn):
         ent_df = None
 
     articles = []
-    for url, text, blob, pub_date, bucket, ents in rows:
+    graded = 0
+    for url, text, blob, pub_date, bucket, ents, scale in rows:
         if not blob:
             continue
         emb = np.frombuffer(blob, dtype=np.float32).copy()
@@ -165,10 +167,12 @@ def load_week_articles(conn):
         prom = 0.0 if ent_df is None else entities.weight(
             entities.prominent(ents, ent_df, config.ENTITY_MIN_DF),
             config.ENTITY_FULL_AT)
-        articles.append((url, text, emb, pub_date or "", bucket or "MIX", prom))
+        graded += scale in _SCALE_VALUE
+        articles.append((url, text, emb, pub_date or "", bucket or "MIX", prom,
+                         scale))
 
-    log.info("Загружено статей за неделю: %d | заметных субъектов в словаре: %d",
-             len(articles), known)
+    log.info("Загружено статей за неделю: %d | заметных субъектов в словаре: %d "
+             "| с оценкой масштаба: %d", len(articles), known, graded)
     return articles
 
 # ---------------------------------------------------------------------------
@@ -236,10 +240,30 @@ def _lexrank_scores(
     return scores
 
 
+_ART_FIELDS = 7          # url, text, emb, pub_date, bucket, prom, scale
+_SCALE_VALUE = {1: 0.0, 2: 0.5, 3: 1.0}
+_SCALE_UNGRADED = 0.5    # старая строка без оценки не должна ни падать, ни расти
+
+
 def _versions(art: tuple) -> list:
     """Все версии сюжета: [(url, text, ...), ...]. У несгруппированной
     статьи — она сама, поэтому вызывать можно на чём угодно."""
-    return art[6] if len(art) > 6 else [art]
+    return art[_ART_FIELDS] if len(art) > _ART_FIELDS else [art]
+
+
+def _story_scale(art: tuple):
+    """Национальный масштаб сюжета в [0,1] или None, если его никто не оценивал.
+
+    По версиям берётся СРЕДНЕЕ, а не максимум. Максимум казался естественным
+    («хоть одна редакция описала событие как национальное»), но замер 08.08.2026
+    показал, в чём подвох: судья ставит тройку примерно каждой третьей принятой
+    статье, поэтому у сюжета из тринадцати перепечаток тройка находится почти
+    наверняка — и максимум превращает фактор в тот же охват, только шумный.
+    Среднее пользуется перепечатками ровно наоборот: это несколько независимых
+    оценок одного события, и разброс судьи они гасят.
+    """
+    vals = [_SCALE_VALUE[v[6]] for v in _versions(art) if v[6] in _SCALE_VALUE]
+    return sum(vals) / len(vals) if vals else None
 
 
 def _group_stories(subset: list) -> list:
@@ -280,35 +304,54 @@ def _group_stories(subset: list) -> list:
 
 
 def _importance(subset: list, embeddings: np.ndarray) -> np.ndarray:
-    """Важность сюжетов корзины в [0, 1] — четыре фактора, без LLM.
+    """Важность сюжетов корзины в [0, 1] — пять факторов, без отдельного LLM.
 
-        lexrank  — тематическая центральность в недельном окне;
+        scale    — национальный масштаб события глазами судьи (1..3);
         coverage — сколько РАЗНЫХ изданий написали о сюжете;
+        topic    — вероятность локального предфильтра «это наша тема»;
         entity   — политический вес субъектов (см. entities.py);
-        topic    — вероятность локального предфильтра «это наша тема».
+        lexrank  — тематическая центральность в недельном окне.
 
-    Веса — в config.IMPORTANCE_W_*; ноль выключает фактор. Фактор topic
-    выключается сам, пока артефакт предфильтра не обучен.
+    Веса — в config.IMPORTANCE_W_*; ноль выключает фактор. Факторы scale и
+    topic выключаются сами, пока нет оценок и артефакта предфильтра.
 
     Почему одного LexRank было мало: он меряет плотность связей, а корзина
     на 40% состоит из однотипных заметок «школьник сдал экзамен» из разных
     городов — они образуют такую же плотную клику, как настоящий сюжет, и
-    заметка про одну школу в Кадыкёе получала важность 0.966.
+    заметка про одну школу в Кадыкёе получала важность 0.966. Замер 08.08.2026
+    добил вопрос: корреляция LexRank с числом написавших изданий −0.117, то
+    есть он систематически поднимает то, о чём не написал больше никто, и его
+    вес выставлен в ноль (тогда он и не считается).
     """
-    lex = importance.minmax(_lexrank_scores(
+    w_lex = config.IMPORTANCE_W_LEXRANK
+    lex = (importance.minmax(_lexrank_scores(
         embeddings, domains=[importance.domain(a[0]) for a in subset]))
+        if w_lex else np.zeros(len(subset)))
 
-    cov = np.array([importance.coverage_weight(
-        importance.distinct_domains(v[0] for v in _versions(a)),
-        config.COVERAGE_FULL_AT) for a in subset], dtype=np.float64)
+    # Охват нормируется ПО КОРЗИНЕ, а не по абсолютной шкале. Абсолютный
+    # потолок в 12 изданий насыщал турецкую корзину (сюжеты с 30, 18 и 13
+    # изданиями были неразличимы — все 1.0) и не достигался в CA/SC, где
+    # максимум за неделю 9 и 5: один и тот же вес значил в корзинах разное.
+    n_dom = [importance.distinct_domains(v[0] for v in _versions(a))
+             for a in subset]
+    full_at = max(max(n_dom, default=0), config.COVERAGE_FULL_AT_MIN)
+    cov = np.array([importance.coverage_weight(n, full_at) for n in n_dom],
+                   dtype=np.float64)
 
     ent = np.array([max(v[5] for v in _versions(a)) for a in subset],
                    dtype=np.float64)
     w_ent = config.IMPORTANCE_W_ENTITY if ent.any() else 0.0
 
-    factors = [(config.IMPORTANCE_W_LEXRANK, lex),
+    raw_scale = [_story_scale(a) for a in subset]
+    sc = np.array([_SCALE_UNGRADED if s is None else s for s in raw_scale],
+                  dtype=np.float64)
+    w_scale = (config.IMPORTANCE_W_SCALE
+               if any(s is not None for s in raw_scale) else 0.0)
+
+    factors = [(w_lex, lex),
                (config.IMPORTANCE_W_COVERAGE, cov),
-               (w_ent, ent)]
+               (w_ent, ent),
+               (w_scale, sc)]
 
     p = prefilter.score(config.PREFILTER_PATH, embeddings)
     if p is not None:

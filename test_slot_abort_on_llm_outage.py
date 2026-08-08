@@ -32,13 +32,14 @@ def _dead_ring():
 def _reserve(n):
     """n кандидатов-сюжетов, попарно непохожих — дубликат-фильтр их не срежет.
 
-    Формат тот же, что отдаёт _group_stories: статья плюс седьмым полем
+    Формат тот же, что отдаёт _group_stories: статья плюс восьмым полем
     список её версий."""
     out = []
     for i in range(n):
         emb = np.zeros(8, dtype=np.float32)
         emb[i % 8] = 1.0
-        art = (f"https://example.com/a{i}", f"text {i}", emb, "2026-07-29", "TR", 0.0)
+        art = (f"https://example.com/a{i}", f"text {i}", emb, "2026-07-29",
+               "TR", 0.0, None)
         out.append(art + ([art],))
     return out
 

@@ -28,8 +28,9 @@ daily_collector.py — сбор статей за сутки (или за нед
                              в LLM уходит один представитель; в БД пишутся все.
     6. prefilter           — локальный классификатор-дистиллят отбрасывает
                              заведомый мусор без запроса к LLM (если обучен).
-    7. judge_parallel()    — ОДИН LLM-вызов отдаёт и релевантность, и регион
-                             (TR/CA/SC/MIX). Нет ответа -> pending, не отказ.
+    7. judge_parallel()    — ОДИН LLM-вызов отдаёт релевантность, регион
+                             (TR/CA/SC/MIX) и масштаб события (1..3) одной
+                             строкой. Нет ответа -> pending, не отказ.
     8. flush_batch()       — пишет принятые статьи с готовым embedding в БД.
 """
 import os
@@ -193,14 +194,37 @@ _JUDGE_SYSTEM = (
     "  MIX - relevant, but the region is unclear.\n"
     "If Turkey is the main actor or location, choose TR.\n"
     "\n"
+    "Right after the region, append ONE digit — how much this event CHANGES the "
+    "country's science, education or youth system:\n"
+    "  3 - the country as a whole is different afterwards: a law or reform "
+    "adopted, a national programme launched or funded, an intergovernmental "
+    "agreement signed, a new university, national laboratory or research centre "
+    "opened, national statistics or a country-wide ranking published, a research "
+    "result of national or international significance;\n"
+    "  2 - a real change inside ONE institution or ONE sector, or an official "
+    "announcement that such a change is being prepared: a large grant, a new "
+    "faculty or department, a partnership with concrete money or obligations "
+    "behind it, an announced revision of an exam or a curriculum;\n"
+    "  1 - nothing in the system changes: a meeting, a visit, a forum, a "
+    "competition or its results, a corporate or charitable initiative, and any "
+    "seasonal or annual routine — enrolment, school uniforms, timetables, "
+    "scholarship lists, grant winners of a regular contest.\n"
+    "Be strict. In a batch of ten articles usually no more than two deserve 3, "
+    "and 1 is the most common answer. A ministry, a minister or a national "
+    "company as the ACTOR does not by itself make the event national, and "
+    "neither does the fact that it takes place across the whole country: ask "
+    "what would be DIFFERENT in the country if this news had not happened. "
+    "\"NO\" carries no digit.\n"
+    "\n"
     "The article may be in any language — judge by content, not language."
 )
 
 _JUDGE_USER_TMPL = (
     "Below are {n} articles, each preceded by its number in square brackets.\n"
     "Reply ONLY with a JSON object mapping every article number to its verdict, "
-    'no extra text — e.g. {{"1": "CA", "2": "NO", "3": "TR"}}.\n'
-    'Allowed values: "NO", "TR", "CA", "SC", "MIX". '
+    'no extra text — e.g. {{"1": "CA2", "2": "NO", "3": "TR3"}}.\n'
+    'Allowed values: "NO", or one of "TR", "CA", "SC", "MIX" immediately '
+    "followed by the scale digit 1, 2 or 3. "
     "Every number from 1 to {n} must appear exactly once.\n\n"
     "{articles}"
 )
@@ -212,10 +236,27 @@ JUDGE_BATCH = LLM_FILTER_BATCH
 # чтобы вердикт нельзя было спутать с ответом судьи ни здесь, ни в журнале.
 _PREFILTERED = object()
 _VERDICTS = ("NO", "TR", "CA", "SC", "MIX")
+# Регион и цифра масштаба приезжают одним значением ("TR3"): второй вызов LLM
+# ради масштаба стоил бы ещё один суточный лимит, а судья статью уже прочитал.
+# Цифра необязательна — старый ответ без неё разбирается как раньше.
+#
+# Рубрика масштаба калибрована замером 08.08.2026, а не написана на глаз.
+# Первая редакция («насколько событие национально важно» + перечень признаков)
+# дала 45 троек из 57 оценённых: судья читал «министерство» и «по всей стране»
+# как масштаб сам по себе, и в тройки попадали продажа школьной формы и
+# корпоративная программа Turkcell, а «меняются задания национального экзамена
+# YKS» получало двойку. Помогли три добавки: вопрос «что было бы в стране
+# ИНАЧЕ, если бы этой новости не было», явный список рутины в пункте 1 и
+# указание доли (не больше двух троек на десяток). На той же выборке стало
+# 8/11/12 при 1/2/3 — и переехало именно то, что должно было.
+_VERDICT_RE = re.compile(r"(NO|TR|CA|SC|MIX)\s*([1-3])?$")
 
 
 def _parse_judge(content, n):
-    """-> список длины n; None на позиции = решения по этой статье нет."""
+    """-> список пар (регион, масштаб) длины n; None на позиции = решения нет.
+
+    Масштаб — 1..3 или None, если модель цифру не поставила (масштаб тогда
+    считается средним, см. sunday_processor_mmr._story_scale)."""
     m = re.search(r"\{.*\}", content or "", re.DOTALL)
     if not m:
         return None
@@ -228,8 +269,9 @@ def _parse_judge(content, n):
     out = []
     for i in range(1, n + 1):
         v = data.get(str(i), data.get(i))
-        v = str(v).strip().upper() if v is not None else ""
-        out.append(v if v in _VERDICTS else None)
+        m = _VERDICT_RE.match(str(v).strip().upper()) if v is not None else None
+        out.append((m.group(1), int(m.group(2)) if m.group(2) else None)
+                   if m else None)
     return out
 
 
@@ -570,17 +612,17 @@ def cluster_duplicates(embs, threshold):
 
 
 def flush_batch(conn, batch):
-    """batch items: (qi, url, fetch_date, publish_date, title, text, region, lang, entities, emb)"""
+    """batch items: (qi, url, fetch_date, publish_date, title, text, region, lang, entities, emb, scale)"""
     if not batch:
         return 0
     inserted = 0
-    for (qi, url, fd, pdate, title, text, bucket, lang, ents, emb) in batch:
+    for (qi, url, fd, pdate, title, text, bucket, lang, ents, emb, scale) in batch:
         try:
             conn.execute(
                 "INSERT OR IGNORE INTO articles "
-                "(query_index,url,fetch_date,publish_date,title,text,embedding,region_bucket,language,entities) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (qi, url, fd, pdate, title, text, emb.tobytes(), bucket, lang, ents))
+                "(query_index,url,fetch_date,publish_date,title,text,embedding,region_bucket,language,entities,scale) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (qi, url, fd, pdate, title, text, emb.tobytes(), bucket, lang, ents, scale))
             inserted += 1
         except Exception as exc:
             log.warning("INSERT error %s: %s", url, exc)
@@ -698,12 +740,12 @@ def main():
                     marks.append((url, qi, "pending", None))
                 elif v is _PREFILTERED:
                     marks.append((url, qi, "prefiltered", None))
-                elif v == "NO":
+                elif v[0] == "NO":
                     marks.append((url, qi, "rejected", embs[i]))
                 else:
                     marks.append((url, qi, "accepted", embs[i]))
-                    batch.append((qi, url, fetch_date, pdate, title, text, v, lang,
-                                  ents, embs[i]))
+                    batch.append((qi, url, fetch_date, pdate, title, text, v[0],
+                                  lang, ents, embs[i], v[1]))
             seen_store.mark(conn, marks, fetch_date)
             for k in range(0, len(batch), BATCH_SIZE):
                 total_new += flush_batch(conn, batch[k:k + BATCH_SIZE])
