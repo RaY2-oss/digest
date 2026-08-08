@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Спасательный проход браузером: сторож заглушек и общий бюджет.
+"""Спасение текста: сторож заглушек, лестница способов и общий бюджет.
 
-Браузер здесь не поднимается — он стоит пятнадцать секунд на страницу, а
-проверять надо не его, а то, что вокруг: заглушку антибота не пускать в
-статьи, а бюджет тратить на открытые страницы, не на удавшиеся.
+Ни браузер, ни архив здесь не поднимаются и не опрашиваются — они стоят
+секунд и живут в сети, а проверять надо не их, а то, что вокруг: заглушку
+антибота не пускать в статьи, разбор повторять на полноту, архив спрашивать
+раньше браузера, а бюджет тратить на открытые страницы, не на удавшиеся.
 
 Запуск: ./venv/bin/python test_browser_rescue.py
 """
@@ -11,6 +12,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import archive_fetch
 import config
 import daily_collector as dc
 
@@ -64,6 +66,60 @@ def check_budget():
     print("  бюджет: 5 страниц на два запроса разошлись как 3 + 2, добавки нет")
 
 
+def check_recall_retry():
+    """Пустой разбор на точность обязан переспрашиваться на полноту.
+
+    Разбор на точность отрезает всё, в чём не уверен, и на непривычной вёрстке
+    оставляет пустоту — на замере из ста «пустых» адресов повтор на полноту
+    добавлял десять статей. Проверяем не trafilatura, а порядок: второй заход
+    случается тогда и только тогда, когда от первого нет текста выше порога.
+    """
+    calls, real = [], dc._pull
+
+    def spy(html, url, recall):
+        calls.append(recall)
+        return ("з" * 40, "т") if recall is False else ("с" * 900, "т")
+
+    dc._pull = spy
+    try:
+        text, _, _ = dc.extract_page("<html></html>", "https://example.org/a")
+        assert calls == [False, True], calls
+        assert len(text) == 900, "взят короткий разбор вместо полного"
+
+        calls.clear()
+        dc._pull = lambda html, url, recall: (calls.append(recall)
+                                              or ("д" * 900, "т"))
+        dc.extract_page("<html></html>", "https://example.org/b")
+        assert calls == [False], "полный разбор дёрнули без нужды: %r" % (calls,)
+    finally:
+        dc._pull = real
+    print("  разбор: короткий результат переспрошен на полноту, длинный — нет")
+
+
+def check_archive_before_browser():
+    """Архив отвечает раньше браузера, и браузеру достаётся только остаток.
+
+    Архив дешевле браузера впятеро и берёт вдвое больше (замер в
+    archive_fetch), поэтому бюджет браузера обязан тратиться на то, чего в
+    архиве не нашлось.
+    """
+    have = {"https://a.example/1": ARTICLE.encode("utf-8")}
+    asked, real = [], archive_fetch.snapshot
+    archive_fetch.snapshot = lambda u, **kw: (asked.append(u) or have.get(u))
+    try:
+        hard = ["https://a.example/1", "https://b.example/2"]
+        got = dc.rescue_from_archive(hard)
+        assert asked == hard, asked
+        assert list(got) == ["https://a.example/1"], got
+        assert got["https://a.example/1"][0].startswith("Иорданский"), got
+        left = [u for u in hard if u not in got]
+        assert left == ["https://b.example/2"], left
+    finally:
+        archive_fetch.snapshot = real
+    assert dc.rescue_from_archive([]) == {}
+    print("  лестница: архив взял своё, браузеру остался только остаток")
+
+
 def check_pass_through():
     """Пустой список браузер не поднимает — прогон без неудач не платит."""
     assert dc.rescue_with_browser([]) == {}
@@ -72,6 +128,8 @@ def check_pass_through():
 
 if __name__ == "__main__":
     check_antibot()
+    check_recall_retry()
+    check_archive_before_browser()
     check_budget()
     check_pass_through()
-    print("спасение браузером: ок")
+    print("спасение текста: ок")

@@ -55,6 +55,7 @@ from htmldate import find_date
 from langdetect import DetectorFactory, LangDetectException, detect
 from trafilatura import bare_extraction
 
+import archive_fetch
 import config
 import gkg_filter
 import prefilter
@@ -472,25 +473,36 @@ ANTIBOT_PATTERNS = re.compile(
     r"and cookies|cloudflare ray id|are you a robot|проверка безопасности", re.I)
 
 
-def extract_page(html, url):
-    """HTML -> (text, title, publish_date). Отдельно от загрузки: тем же
-    разбором живёт спасательный проход браузером, и правила извлечения у
-    обоих обязаны совпадать."""
-    text, title = None, None
+def _pull(html, url, recall):
     try:
-        data = bare_extraction(
-            html, url=url, with_metadata=True,
-            include_comments=False, favor_precision=True,
-        )
-        if data:
-            if hasattr(data, "text"):
-                text  = (data.text  or "").strip()
-                title = (data.title or "").strip()
-            else:
-                text  = (data.get("text",  "") or "").strip()
-                title = (data.get("title", "") or "").strip()
+        kw = {"favor_recall": True} if recall else {"favor_precision": True}
+        data = bare_extraction(html, url=url, with_metadata=True,
+                               include_comments=False, **kw)
     except Exception as exc:
         log.warning("trafilatura failed %s: %s", url, exc)
+        return None
+    if not data:
+        return None
+    if hasattr(data, "text"):
+        return (data.text or "").strip(), (data.title or "").strip()
+    return (data.get("text", "") or "").strip(), (data.get("title", "") or "").strip()
+
+
+def extract_page(html, url):
+    """HTML -> (text, title, publish_date). Отдельно от загрузки: тем же
+    разбором живут спасательные проходы (архив, браузер), и правила извлечения
+    у всех обязаны совпадать.
+
+    Разбор идёт в два захода. Первый — на точность: он отрезает всё, в чём не
+    уверен, и на статье с непривычной вёрсткой запросто оставляет пустоту.
+    Второй, на полноту, включается только когда от первого не осталось текста
+    выше порога — терять на этом нечего, страница и так была бы отброшена.
+    Замер на ста «пустых» адресах: 26 против 36 (см. archive_fetch).
+    """
+    got = _pull(html, url, recall=False)
+    if not got or len(got[0]) < config.MIN_TEXT_LENGTH:
+        got = _pull(html, url, recall=True) or got
+    text, title = got if got else (None, None)
 
     if ANTIBOT_PATTERNS.search((title or "") + " " + (text or "")[:1500]):
         log.info("Антибот вместо статьи: %s", url)
@@ -518,6 +530,29 @@ def take_for_browser(shorts, budget):
     take = shorts[:max(budget[0], 0)]
     budget[0] -= len(take)
     return take
+
+
+def rescue_from_archive(urls):
+    """Спасение снимком из Web Archive — первая ступень, до браузера.
+
+    Берёт вдвое больше браузера и стоит секунды вместо пятнадцати, поэтому
+    бюджета ему не нужно: замер и вся лестница способов — в archive_fetch.
+    Идёт подряд, без пула: архив чужой и некоммерческий, пачка потоков
+    заканчивается рванными соединениями. -> {url: (text, title, publish_date)}
+    """
+    out = {}
+    for url in urls:
+        raw = archive_fetch.snapshot(url)
+        if not raw:
+            continue
+        # Снимок сырой (id_): баннера архива с его собственной датой в
+        # разметке нет, дату публикации читаем из меток исходной страницы.
+        text, title, pdate = extract_page(raw, url)
+        if text and len(text) >= config.MIN_TEXT_LENGTH:
+            out[url] = (text, title, pdate)
+    if urls:
+        log.info("Архивом спасено %d из %d", len(out), len(urls))
+    return out
 
 
 def rescue_with_browser(urls):
@@ -787,10 +822,14 @@ def main():
                 elif v != "accepted":
                     marks.append((item[0], qi, v, None))
 
-            # Кому обычный запрос текста не отдал — тому браузер: другой
-            # попытки не будет, "short" окончателен с первого раза.
-            rescued = rescue_with_browser(
-                take_for_browser([u for u, _, _ in shorts], budget))
+            # Кому обычный запрос текста не отдал — того спасаем: другой
+            # попытки не будет, "short" окончателен с первого раза. Сперва
+            # архив — он дешевле и берёт больше; браузер тратит свой скудный
+            # бюджет только на то, чего в архиве не нашлось.
+            hard = [u for u, _, _ in shorts]
+            rescued = rescue_from_archive(hard)
+            rescued.update(rescue_with_browser(take_for_browser(
+                [u for u in hard if u not in rescued], budget)))
             for item in shorts:
                 got = rescued.get(item[0])
                 if not (got and sift(item, got) == "accepted"):

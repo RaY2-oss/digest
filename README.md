@@ -24,15 +24,30 @@ to repurpose this for a different beat.
    let the model confirm its own decisions run after run.
 
    Pages that returned no usable text get one more chance at the end of the
-   run, from a real browser (`rescue_with_browser`, camoufox): `short` is final
-   on the first attempt, so it is now or never. Measured on 100 such URLs
-   (2026-08-08), counting only genuine articles: a plain `requests` retry 23,
-   `curl_cffi` with a Chrome TLS fingerprint 23, camoufox 32. At ~15 s/page the
-   browser stays out of the main fetch loop and is capped at
-   `config.CAMOUFOX_MAX` pages per run. `ANTIBOT_PATTERNS` in `extract_page`
-   keeps anti-bot interstitials out of the corpus — they are 300–500 characters
-   of prose, i.e. comfortably above `MIN_TEXT_LENGTH`, and shields answer a
-   browser more readily than a script.
+   run — `short` is final on the first attempt, so it is now or never. The
+   chance is a ladder, cheapest rung first. Measured on 100 such URLs
+   (2026-08-08), counting only genuine articles:
+
+   | rung | rescued | cost |
+   |---|---|---|
+   | plain `requests` retry | 26 | one request |
+   | + second `trafilatura` pass with `favor_recall` | 36 | none, same HTML |
+   | `articleBody` from JSON-LD | 11 (**+0**) | — *not wired in* |
+   | `/amp` URL variants | 29 (**+2**) | 3 requests each — *not wired in* |
+   | Web Archive snapshot (`rescue_from_archive`) | 39 (**+24**) | ~2 s |
+   | camoufox (`rescue_with_browser`) | 32 | ~15 s |
+   | **all wired rungs together** | **62** | |
+
+   So the recall retry is free and lives inside `extract_page` itself; the
+   archive (`archive_fetch.py`, shared with gdelt_rss) runs before the browser
+   and takes roughly twice as many pages for a fifth of the time; the browser
+   is last and spends its `config.CAMOUFOX_MAX` budget only on what the
+   archive did not have. Rationale for each rejected rung — and for querying
+   the availability API rather than CDX — is in `archive_fetch.py`'s header.
+
+   `ANTIBOT_PATTERNS` in `extract_page` keeps anti-bot interstitials out of
+   the corpus — they are 300–500 characters of prose, i.e. comfortably above
+   `MIN_TEXT_LENGTH`, and shields answer a browser more readily than a script.
 2. **LLM relevance/topic check** — via `model_rotation.py`, which rotates
    across OpenRouter's free-tier models, then falls back to Groq, then
    Google (Gemini), round-robin, with per-provider cooldown on exhaustion.
