@@ -458,8 +458,24 @@ def fetch_and_extract(url):
     except Exception as exc:
         log.warning("Failed to download %s: %s", url, exc)
         return None, None, None
+    return extract_page(resp.text, url)
 
-    html = resp.text
+
+# Страница-заглушка антибота: щит отдаёт двухсотку с человеческим текстом, и
+# для trafilatura это обычная статья на 300–500 символов — то есть ровно выше
+# MIN_TEXT_LENGTH. Особенно бьёт по спасательному проходу: браузер щит
+# проходит не всегда, и половина «спасённого» им оказывалась вот этим.
+ANTIBOT_PATTERNS = re.compile(
+    r"security service to protect|verifies you are not a bot|performing security "
+    r"verification|triggered the security solution|you have been blocked|"
+    r"just a moment|attention required|checking your browser|enable javascript "
+    r"and cookies|cloudflare ray id|are you a robot|проверка безопасности", re.I)
+
+
+def extract_page(html, url):
+    """HTML -> (text, title, publish_date). Отдельно от загрузки: тем же
+    разбором живёт спасательный проход браузером, и правила извлечения у
+    обоих обязаны совпадать."""
     text, title = None, None
     try:
         data = bare_extraction(
@@ -476,6 +492,10 @@ def fetch_and_extract(url):
     except Exception as exc:
         log.warning("trafilatura failed %s: %s", url, exc)
 
+    if ANTIBOT_PATTERNS.search((title or "") + " " + (text or "")[:1500]):
+        log.info("Антибот вместо статьи: %s", url)
+        return None, None, None
+
     publish_date = None
     try:
         publish_date = find_date(
@@ -485,6 +505,69 @@ def fetch_and_extract(url):
         log.debug("htmldate failed %s: %s", url, exc)
 
     return text, title, publish_date
+
+
+def take_for_browser(shorts, budget):
+    """Отрезает от бюджета прогона столько адресов, сколько ещё дозволено.
+
+    Бюджет общий на прогон, а не на запрос GKG, и платится за открытые
+    страницы, а не за спасённые: считать по спасённым значило бы «щит не
+    пустил — открываем ещё одну», и одна трудная страна съедала бы браузер
+    целиком. budget — список из одного числа, чтобы убывать между запросами.
+    """
+    take = shorts[:max(budget[0], 0)]
+    budget[0] -= len(take)
+    return take
+
+
+def rescue_with_browser(urls):
+    """Последняя попытка: открыть страницу настоящим браузером.
+
+    Вердикт "short" здесь окончательный с первого раза (seen_store.FINAL) —
+    второй попытки у статьи не будет никогда, поэтому спасать надо сразу или
+    не спасать вовсе. А спасать есть что: "текста нет" наполовину означает не
+    отсутствие статьи, а отказ чужого сервера — 403 антибот-щиту, пустую
+    двухсотку там, где текст рисует скрипт.
+
+    Замер на сотне адресов, отброшенных как "short" (08.08.2026), считая
+    спасением только настоящую статью (см. ANTIBOT_PATTERNS): обычный
+    requests, повторённый днями позже, вытащил 23, curl_cffi с подделкой
+    TLS-отпечатка Chrome — тоже 23 (то есть подделка отпечатка этим сайтам не
+    указ), camoufox — 32. Без сторожа заглушек те же замеры давали 27, 25 и
+    45: щит отвечает браузеру охотнее, чем скрипту, и его страница длиннее
+    порога. Платит за это прогон пятнадцатью секундами на страницу, поэтому
+    браузер идёт отдельным проходом в конце загрузки, одним экземпляром, и не
+    больше config.CAMOUFOX_MAX страниц за прогон.
+
+    -> {url: (text, title, publish_date)}
+    """
+    out = {}
+    if not urls:
+        return out
+    try:
+        from camoufox.sync_api import Camoufox
+    except ImportError:
+        log.warning("camoufox не установлен — спасать нечем")
+        return out
+    try:
+        with Camoufox(headless=True, humanize=False) as br:
+            for url in urls:
+                try:
+                    page = br.new_page()
+                    page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)   # дорисовка после DOMContentLoaded
+                    html = page.content()
+                    page.close()
+                except Exception as exc:
+                    log.debug("camoufox %s: %s", url, exc)
+                    continue
+                text, title, pdate = extract_page(html, url)
+                if text and len(text) >= config.MIN_TEXT_LENGTH:
+                    out[url] = (text, title, pdate)
+    except Exception as exc:            # браузер может и не подняться
+        log.warning("camoufox не запустился: %s", exc)
+    log.info("Браузером спасено %d из %d", len(out), len(urls))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +728,7 @@ def main():
     fetch_date = time.strftime("%Y-%m-%d")
     total_new = 0
     week_mode = _is_week_mode()
+    budget = [config.CAMOUFOX_MAX]   # страниц браузеру на весь прогон, на все запросы
 
     try:
         for qi in range(len(config.QUERIES_GKG)):
@@ -668,16 +752,19 @@ def main():
                      qi, len(fresh), len(decided), len(queue))
 
             # 3) Загрузка страниц и дешёвые правила.
-            cands, marks = [], []
-            for url, gkg_date, ents in queue:
-                text, title, html_date = fetch_and_extract(url)
+            cands, marks, shorts = [], [], []
+
+            def sift(item, got):
+                """Правила отбора одной статьи -> вердикт. Принятая попутно
+                оседает в cands. Вызывается дважды — из общей загрузки и ещё
+                раз для того, что вытащил браузер, — поэтому и вынесена."""
+                url, gkg_date, ents = item
+                text, title, html_date = got
                 if not text or len(text) < config.MIN_TEXT_LENGTH:
-                    marks.append((url, qi, "short", None))
-                    continue
+                    return "short"
                 lang = detect_text_language(text) or "unk"
                 if is_non_event_article(url, title, text):
-                    marks.append((url, qi, "non_event", None))
-                    continue
+                    return "non_event"
                 # GDELT для этих запросов сущностей почти не отдаёт: колонка
                 # entities в БД пустая на всех 3428 статьях. Достаём их сами
                 # по общему газеттиру (glossary: топонимы Азии и Африки,
@@ -691,6 +778,23 @@ def main():
                     except Exception:
                         log.exception("извлечение сущностей не удалось")
                 cands.append((url, text, html_date or gkg_date, title, lang, ents))
+                return "accepted"
+
+            for item in queue:
+                v = sift(item, fetch_and_extract(item[0]))
+                if v == "short":
+                    shorts.append(item)             # вердикт после спасения
+                elif v != "accepted":
+                    marks.append((item[0], qi, v, None))
+
+            # Кому обычный запрос текста не отдал — тому браузер: другой
+            # попытки не будет, "short" окончателен с первого раза.
+            rescued = rescue_with_browser(
+                take_for_browser([u for u, _, _ in shorts], budget))
+            for item in shorts:
+                got = rescued.get(item[0])
+                if not (got and sift(item, got) == "accepted"):
+                    marks.append((item[0], qi, "short", None))
             seen_store.mark(conn, marks, fetch_date)
             if not cands:
                 log.info("Query #%d: кандидатов после правил не осталось", qi)
