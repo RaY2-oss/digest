@@ -91,7 +91,30 @@ def test_docx_falls_back_to_single_url():
         config.OUTPUT_DIR = old_out
 
 
+def test_story_date_is_the_earliest_reprint():
+    """Дату сюжету даёт первая его перепечатка, а не представитель отбора.
+
+    Представителя выбирает MMR, и это запросто третья по счёту публикация:
+    датировать событие ею — значит показать в дайджесте день, когда сюжет
+    перепечатали, вместо дня, когда о нём написали.
+    """
+    rep = ("u", "t", None, "2026-08-06", "TR", 0.0, "TR1")
+    assert spm._story_date(rep, "нет") == "2026-08-06"
+
+    story = rep + ([("a", "", None, "2026-08-08", "TR", 0.0, "TR1"),
+                    ("b", "", None, "2026-08-04", "TR", 0.0, "TR1"),
+                    # у части статей publish_date не определился — такие в
+                    # счёт не идут, иначе пустая строка выиграла бы min()
+                    ("c", "", None, "", "TR", 0.0, "TR1")],)
+    assert spm._story_date(story, "нет") == "2026-08-04"
+
+    blank = ("u", "t", None, "", "TR", 0.0, "TR1",
+             [("a", "", None, "", "TR", 0.0, "TR1")])
+    assert spm._story_date(blank, "2026-08-01") == "2026-08-01"
+
+
 if __name__ == "__main__":
+    test_story_date_is_the_earliest_reprint()
     test_single_version_budget_unchanged()
     test_several_versions_share_the_budget()
     test_extra_versions_are_dropped_not_squeezed()
