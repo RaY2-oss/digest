@@ -56,10 +56,17 @@ to repurpose this for a different beat.
    **stories**: near-duplicates (cosine ≥ `STORY_COSINE`) become one candidate
    carrying all its reprints. Then MMR (Maximal Marginal Relevance) selects a
    diverse, non-redundant top-N per region quota, and the LLM re-tells each
-   winner **in English** — from *all* its reprints at once (see step 4).
+   winner **in Russian** — from *all* its reprints at once (see steps 4–5).
 
-   Story importance blends four factors, none of which costs an API call
-   (`config.IMPORTANCE_W_*`; a weight of 0 switches its factor off):
+   Story importance blends five factors, none of which costs an API call
+   (`config.IMPORTANCE_W_*`; a weight of 0 switches its factor off). One outlet
+   gets one vote in every one of them: `importance.publisher()` collapses both
+   domains and wire-syndication networks, `lexrank` zeroes intra-domain edges,
+   `entity` takes the max over versions and `scale` averages per publisher
+   first. Without that last step a paper that ran the same piece twice voted
+   twice — over the week of 09.08 that shifted the scale of 26 stories out of
+   725, by 0.062 on average and up to 0.225, which at weight 0.40 is worth a
+   place or two in the selection.
 
    - **lexrank** over the cosine-similarity graph — thematic centrality.
    - **coverage** — how many *distinct outlets* filed the story. LexRank alone
@@ -79,6 +86,11 @@ to repurpose this for a different beat.
      names is downloaded — prominence is derived from our own corpus, so it is
      multilingual and self-updating. The factor stays off by itself while no
      actor clears the threshold.
+   - **scale** — how far the event reaches, graded by the LLM judge that
+     already reads the article (`"TR3"` — bucket plus one digit, no extra
+     call): one institution, a city, a country, beyond it. Averaged over the
+     story's versions rather than maxed, so a single outlet calling its own
+     story national cannot carry it alone.
    - **topic** — the local classifier's probability (see `prefilter.py` below),
      reused here as a continuous "is this our subject at all" measure. Without
      it the thin CA/SC buckets floated chess politics, party-building reports
@@ -88,7 +100,9 @@ to repurpose this for a different beat.
 4. **Retelling a story, not an article** — the prompt carries up to
    `RETELL_MAX_VERSIONS` reprints of the same story under a shared character
    budget (`RETELL_CHARS_*`), and every URL that went into the prompt is
-   printed under the summary in the `.docx`. Different newsrooms keep different
+   printed under the summary in the `.docx`, all of them on one `URL:` line
+   separated by `; ` — one line each took more room under a story than the
+   summary itself. Different newsrooms keep different
    details — figures, names, quotes — and previously all but one reprint were
    simply discarded (49 of them in the run of 26.07). The caps are the point:
    past them the free-tier models start truncating JSON and inventing links
@@ -104,6 +118,23 @@ to repurpose this for a different beat.
    multi-version stories: 313 distinct words and 515 distinct trigrams per
    prompt against 265 and 434 for truncation, in a 22% *shorter* prompt, and
    3.25 outlets represented instead of 2.88.
+
+   The same call also names the **date of the event** (`event_date.py`). It is
+   nowhere else: GKG carries the dump timestamp and the page markup the
+   publication time, so a summit held on 29 July under a story first filed on
+   2 August was dated 02.08. Only the article text says otherwise, so something
+   has to *read* it — and a hallucinated date in a heading looks exactly as
+   convincing as a real one. Hence a guard rather than trust: the date must
+   fall in `[today − 7 days, first publication]` (later than publication is a
+   deadline, not an event) and must be spelled out **literally** in the text
+   the model was given, in any of the nine languages whose month names
+   `dateparser`'s locales supply. Anything else falls back to the publication
+   date, and every printed date is clamped to the one-week window. Doing the
+   reading with a regex instead was measured and dropped: on the week of
+   09.08 it found a date for 22–35% of stories and changed 4–9% of them, about
+   half of those wrongly — «her geçen gün» ("with every passing day") became
+   yesterday and «1 Ağustos itibarıyla» ("as of 1 August") became the event
+   day. Form does not separate those from real dates; meaning does.
 5. **Russian straight out of the model** — the summary is written in Russian
    in the same call, and the old leg through a local Marian model was dropped
    (07.08.2026): two legs meant the translator's own breakage on top of the
@@ -128,7 +159,16 @@ to repurpose this for a different beat.
 6. **`word_generator.py`** renders the selection to a `.docx`.
 7. **`telegram_sender.py`** delivers it to the configured chat.
 8. **`telegram_bot_listener.py`** — long-polling bot exposing `/rundigest`
-   (manual trigger) and `/resetlock` (clears a stuck run lock).
+   (manual trigger), `/digests` and `/last` (past digests, newest first),
+   `/status` and `/resetlock` (clears a stuck run lock). A run takes minutes,
+   so `/rundigest` reports progress by **editing its own status message**
+   rather than posting a new one per stage: the processor prints
+   `DIGEST_STAGE=<text>` to stdout (same convention as the existing
+   `DIGEST_ARTICLES=n/m`) and the bot streams that from a `Popen` pipe, at most
+   one edit per `EDIT_EVERY` seconds because Telegram rate-limits a chat to
+   roughly one message a second. Every timestamp shown to a reader is Moscow
+   time even though the host runs on UTC — several runs can land on one date,
+   and without the clock they are indistinguishable.
 
 `prefilter.py` / `train_prefilter.py` are a local classifier distilled from the
 LLM's own past verdicts. It does two jobs off one training run: it screens out
@@ -184,7 +224,9 @@ resources they need live outside either repo:
 3. Edit `config.py`: `QUERIES_GKG` (your own topic/country filters).
 4. `venv/bin/python init_db.py`
 5. Wire up cron: `daily_collector.py` every 6h, `sunday_processor_mmr.py`
-   weekly, `cleanup_old_articles.py` daily, `telegram_bot_listener.py` as a
+   weekly (`0 17 * * 0` on a UTC host — 20:00 Moscow, so the digest arrives at
+   the end of the weekend and picks up the 12:00 collection),
+   `cleanup_old_articles.py` daily, `telegram_bot_listener.py` as a
    long-running service.
 
 ## Notes

@@ -5,7 +5,7 @@ sunday_processor_mmr.py — воскресная обработка: отбор 
 методом MMR (Maximal Marginal Relevance), пересказ через OpenRouter,
 сборка .docx и отправка в Telegram.
 
-Запускается по cron в воскресенье 08:00 UTC.
+Запускается по cron в воскресенье 17:00 UTC (20:00 МСК).
 
 Пайплайн:
 1. SELECT статей за последние 7 дней (publish_date или fetch_date).
@@ -1094,6 +1094,20 @@ def _postprocess_digest(summaries: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Ход прогона наружу
+# ---------------------------------------------------------------------------
+def stage(text: str):
+    """Этап прогона — в stdout машиночитаемой строкой.
+
+    Читает её telegram_bot_listener и правит ИМ ЖЕ отправленное сообщение о
+    запуске, а не шлёт новое на каждый шаг. Через stdout, а не через лог:
+    `DIGEST_ARTICLES=` там уже едет тем же способом, а лог — это русская проза
+    для человека, и разбирать её боту значит привязать его к формулировкам.
+    """
+    print("DIGEST_STAGE=%s" % text, flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Очистка старых данных
 # ---------------------------------------------------------------------------
 def cleanup_old(conn):
@@ -1113,11 +1127,13 @@ def main():
 
     conn = sqlite3.connect(config.DB_PATH)
     try:
+        stage("Читаю статьи за неделю")
         articles = load_week_articles(conn)
         if not articles:
             log.warning("Нет статей за неделю — дайджест не формируется.")
             return
 
+        stage("Отбираю сюжеты из %d статей" % len(articles))
         reps, regional_reserves = select_representatives(articles)
         if not reps:
             log.warning("Не удалось выбрать представителей.")
@@ -1135,6 +1151,7 @@ def main():
                 continue
 
             slot_label = f"[{len(summaries)+1}/{target}]"
+            stage("Пересказываю сюжет %d из %d" % (len(summaries) + 1, target))
             result = _process_slot(
                 primary=rep,
                 regional_reserves=regional_reserves,
@@ -1159,6 +1176,7 @@ def main():
             log.error("Нет пересказанных статей — дайджест не формируется.")
             return
 
+        stage("Свожу дубликаты")
         summaries = _postprocess_digest(summaries)
         log.info("После пост-обработки статей: %d", len(summaries))
 
@@ -1169,9 +1187,11 @@ def main():
         for item in summaries:
             item.pop("embedding", None)
 
+        stage("Собираю документ из %d пунктов" % len(summaries))
         docx_path = build_digest(summaries)
         log.info("Документ сохранён: %s", docx_path)
 
+        stage("Отправляю")
         target_chat_id = os.environ.get("TARGET_CHAT_ID")
         ok = send_document(
             docx_path,

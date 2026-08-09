@@ -9,7 +9,8 @@ telegram_sender.py — отправка готового .docx в Telegram ме�
 
 import logging
 import os
-import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -55,7 +56,11 @@ def send_document(file_path, chat_id=None):
         return False
 
     url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendDocument"
-    caption = f"\U0001F4C4 Дайджест ИВ РАН — {time.strftime('%d.%m.%Y')}"
+    # Время московское, а не серверное UTC: прогонов за день бывает несколько
+    # (ручной /rundigest поверх воскресного cron), и по одной дате их не
+    # различить. Тот же формат, что у /digests в боте.
+    stamp = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y %H:%M МСК")
+    caption = f"\U0001F4C4 Дайджест ИВ РАН — {stamp}"
     ok_any = False
 
     for target in targets:
