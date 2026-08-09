@@ -92,7 +92,18 @@ to repurpose this for a different beat.
    details — figures, names, quotes — and previously all but one reprint were
    simply discarded (49 of them in the run of 26.07). The caps are the point:
    past them the free-tier models start truncating JSON and inventing links
-   between the versions.
+   between the versions. What goes into that budget is a *selection*, not the
+   first N characters of each version (`retell_select.py`): reprints share
+   their lead verbatim, so truncation spent the budget printing one lead four
+   times while the distinguishing details sat below the cut. Selection scores
+   sentences by tf-idf centrality over the story's own sentences, goes round
+   robin so no outlet takes a second sentence before every outlet has taken a
+   first, and rejects a sentence whose 4-word shingles are already 28% covered.
+   A fragment with no sentence-final punctuation is not a sentence — that is
+   what a quota table row and a subhead look like. Measured on 244
+   multi-version stories: 313 distinct words and 515 distinct trigrams per
+   prompt against 265 and 434 for truncation, in a 22% *shorter* prompt, and
+   3.25 outlets represented instead of 2.88.
 5. **Translation to Russian** — the LLM writes English on purpose; the final
    Russian text comes from a local Marian model (`opus-mt-tc-big-en-zle` via
    CTranslate2 int8, `translate_ru.py`), run *after* the dedup pass so

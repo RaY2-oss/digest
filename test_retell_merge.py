@@ -5,8 +5,11 @@ test_retell_merge.py — пересказ сюжета по НЕСКОЛЬКИМ
 Раньше в промпт уходила ровно одна статья, а её дубликаты с других сайтов
 _process_slot просто выбрасывал (прогон 26.07: 49 отброшенных). Детали, которые
 сохранила только одна редакция — цифры, имена, цитаты, — терялись вместе с ними.
-Теперь версии сюжета склеиваются в один промпт под общим потолком по символам,
-и все использованные ссылки идут в документ.
+Потом версии стали склеиваться в один промпт, но каждая резалась по первым N
+символов — а перепечатки начинаются одинаково, и модель получала один и тот же
+лид четыре раза. Теперь в промпт идёт ОТБОР по всем версиям сразу
+(retell_select): предложения, которых ещё не было, от как можно большего числа
+изданий. Все использованные ссылки идут в документ.
 
 Запуск: venv/bin/python test_retell_merge.py
 """
@@ -18,41 +21,68 @@ import config
 import sunday_processor_mmr as spm
 import word_generator
 
-
-def _v(url, n):
-    return (url, "z" * n)
+_STEM = "alpha beta gamma delta epsilon zeta eta theta iota kappa".split()
 
 
-def test_single_version_budget_unchanged():
-    """Одна версия получает столько же символов, сколько получала раньше
-    единственная статья, — переход не должен дорожать на обычной новости."""
-    src = spm._retell_sources([_v("https://a.com/1", 10_000)])
-    assert src.count("z") == config.RETELL_CHARS_PER_VERSION, src.count("z")
+def _sent(seed):
+    """Предложение из слов, которых нет больше нигде: отбор обязан засчитать
+    его как новый факт, а не как пересказ соседнего."""
+    return " ".join("%s%d" % (w, seed) for w in _STEM) + "."
+
+
+def _text(seed, n_sents):
+    return " ".join(_sent(seed * 1000 + i) for i in range(n_sents))
+
+
+def test_single_version_fills_the_whole_budget():
+    """Одна версия получает весь бюджет промпта, а не свою долю от него."""
+    src, _ = spm._retell_sources([("https://a.com/1", _text(1, 200))])
     assert "https://a.com/1" in src
+    body = src.split("Article text:\n", 1)[1]
+    assert config.RETELL_CHARS_TOTAL * 0.8 < len(body) <= config.RETELL_CHARS_TOTAL
 
 
 def test_several_versions_share_the_budget():
-    versions = [_v(f"https://o{i}.com/1", 10_000) for i in range(4)]
-    src = spm._retell_sources(versions)
-    assert src.count("z") <= config.RETELL_CHARS_TOTAL, src.count("z")
+    versions = [(f"https://o{i}.com/1", _text(i, 200)) for i in range(4)]
+    src, _ = spm._retell_sources(versions)
+    assert len(src) <= config.RETELL_CHARS_TOTAL * 1.3, len(src)   # + заголовки блоков
     for i in range(4):
         assert f"https://o{i}.com/1" in src
     assert src.count("----------") == 3, "версии обязаны быть разделены"
 
 
+def test_reprints_do_not_eat_the_budget_twice():
+    """Главное, ради чего отбор и делался: пять дословных перепечаток обязаны
+    занять в промпте столько же места, сколько одна статья, — иначе модель
+    четырежды читает один и тот же лид вместо четырёх разных деталей."""
+    one, _ = spm._retell_sources([("https://o0.com/1", _text(0, 12))])
+    five, _ = spm._retell_sources([(f"https://o{i}.com/1", _text(0, 12)) for i in range(5)])
+    body_one = one.split("Article text:\n", 1)[1]
+    bodies = five.split("Article text:\n")[1:]
+    assert sum(len(b) for b in bodies) < len(body_one) * 1.5, [len(b) for b in bodies]
+
+
 def test_extra_versions_are_dropped_not_squeezed():
-    """Потолок по числу версий важнее полноты: десять обрывков по 600 символов
-    модель пересказывает хуже, чем четыре внятных куска."""
-    versions = [_v(f"https://o{i}.com/1", 5_000) for i in range(10)]
-    src = spm._retell_sources(versions)
-    assert "https://o3.com/1" in src
-    assert "https://o4.com/1" not in src
-    assert src.count("z") <= config.RETELL_CHARS_TOTAL
+    """Потолок по числу версий важнее полноты: разбирать двадцать перепечаток
+    ради одного-двух новых предложений не стоит времени."""
+    versions = [(f"https://o{i}.com/1", _text(i, 40)) for i in range(10)]
+    src, _ = spm._retell_sources(versions)
+    assert f"https://o{config.RETELL_MAX_VERSIONS - 1}.com/1" in src
+    assert f"https://o{config.RETELL_MAX_VERSIONS}.com/1" not in src
 
 
 def test_empty_text_does_not_break_the_prompt():
-    src = spm._retell_sources([("https://a.com/1", None), ("https://b.com/1", "тело")])
-    assert "https://a.com/1" in src and "тело" in src
+    src, urls = spm._retell_sources([("https://a.com/1", None),
+                                     ("https://b.com/1", _text(2, 5))])
+    assert "https://a.com/1" not in src, "версии без текста в промпте нечего делать"
+    assert "https://b.com/1" in src
+    assert urls == ["https://b.com/1"], "источником зовётся только прочитанный"
+
+
+def test_nothing_to_pick_gives_an_empty_prompt():
+    """Все версии — мусор без единого предложения: промпт пустой, а не битый."""
+    assert spm._retell_sources([("https://a.com/1", "5 30 2026"),
+                                ("https://b.com/1", "")]) == ("", [])
 
 
 def test_docx_lists_every_source_url(tmp="/tmp"):
@@ -115,10 +145,12 @@ def test_story_date_is_the_earliest_reprint():
 
 if __name__ == "__main__":
     test_story_date_is_the_earliest_reprint()
-    test_single_version_budget_unchanged()
+    test_single_version_fills_the_whole_budget()
     test_several_versions_share_the_budget()
+    test_reprints_do_not_eat_the_budget_twice()
     test_extra_versions_are_dropped_not_squeezed()
     test_empty_text_does_not_break_the_prompt()
+    test_nothing_to_pick_gives_an_empty_prompt()
     test_docx_lists_every_source_url()
     test_docx_falls_back_to_single_url()
     print("ok")

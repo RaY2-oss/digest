@@ -90,6 +90,7 @@ import config
 import entities
 import importance
 import prefilter
+import retell_select
 from model_rotation import _call_openrouter_raw, providers_exhausted
 from word_generator import build_digest
 from telegram_sender import send_document
@@ -545,7 +546,8 @@ def select_representatives(articles: list) -> tuple[list, dict]:
 # Системные промпты
 # ---------------------------------------------------------------------------
 _SYSTEM_PROMPT_RETELL = """\
-Retell the source article in RUSSIAN for an academic digest, in about 3–5 sentences.
+Retell the source article in RUSSIAN for an academic digest, in 3–4 sentences \
+forming ONE paragraph.
 The reader follows science, education and youth policy but knows NOTHING about \
 this particular country's institutions, exams, agencies or political parties. \
 Write so that such a reader understands the news without looking anything up.
@@ -581,7 +583,8 @@ never a separate explanatory sentence — the facts of the news must not lose ro
 to them.
 
 Rules:
-- Length: the summary must be about 3–5 sentences — concise, only the essential facts.
+- Length: the summary must be 3–4 sentences — concise, only the essential facts. \
+It is ONE continuous paragraph: no line breaks, no bullet points, no numbered list.
 - Do not leave ANY word, phrase, or clause untranslated in Turkish, English, or any \
 other language — render everything in Russian.
 - Russian grammar, cases, agreement and word order must be correct and natural. \
@@ -604,30 +607,45 @@ and separated by a line of dashes. They are one news event, not several. Merge \
 them into ONE summary: use a fact if any version reports it, and where versions \
 disagree prefer the one reported by more of them. Never present them as separate \
 items and never invent a link between them that no version states.
+- Each block is a SELECTION of sentences from its article, not a continuous \
+excerpt: sentences that stood far apart in the original now stand side by side. \
+Take each sentence as a separate fact. Do not read cause, sequence or contrast \
+into two sentences merely because they are adjacent.
+- Prefer facts that only ONE of the blocks reports — figures, dates, names, \
+conditions, quotes. What every outlet repeats is the headline the reader can \
+guess; what one outlet adds is why several of them were read at all.
 
 Return ONLY valid JSON, no markdown fences:
-{"title": "<заголовок по-русски>", "summary": "<пересказ по-русски, 3–5 предложений>"}
+{"title": "<заголовок по-русски>", "summary": "<пересказ по-русски, 3–4 предложения, один абзац>"}
 """
 
 _USER_PROMPT_RETELL_TEMPLATE = "Article URL: {url}\nArticle text:\n{text}"
 
 
-def _retell_sources(versions: list) -> str:
-    """Тексты версий сюжета в один промпт, под общим потолком по символам.
+def _retell_sources(versions: list) -> tuple[str, list]:
+    """Тексты версий сюжета в один промпт → (промпт, попавшие в него адреса).
 
-    Разные редакции сохраняют разные детали (цифры, имена, цитаты), поэтому
-    пересказ по нескольким версиям полнее. Потолки — из config: одна версия
-    получает столько же символов, сколько получала раньше единственная
-    статья, дальше бюджет делится, чтобы промпт не вылезал из контекста
-    бесплатных моделей.
+    Разные редакции сохраняют разные детали (цифры, имена, цитаты), но
+    начинаются одинаково: перепечатка повторяет лид агентства слово в слово.
+    Поэтому в промпт идёт не начало каждой статьи, а ОТБОР по всем версиям
+    сразу (retell_select) — предложения, которых ещё не было, от как можно
+    большего числа изданий. Бюджет тот же, фактов в нём на четверть больше.
+
+    Издание, у которого не нашлось ничего своего, в промпт не попадает: пустой
+    блок с адресом модели ничего не даёт, а место занимает. Адреса возвращаются
+    отдельно, потому что под пересказом в документе печатаются источники, а
+    источником называться может только тот, кого модель читала.
     """
     versions = versions[:config.RETELL_MAX_VERSIONS]
-    per = min(config.RETELL_CHARS_PER_VERSION,
-              config.RETELL_CHARS_TOTAL // len(versions))
+    picked = retell_select.pick([(v[0], v[1] or "") for v in versions],
+                                config.RETELL_CHARS_TOTAL, config.RETELL_SCAN_CHARS)
+    urls = [v[0] for v in versions if picked.get(v[0])]
     body = "\n\n----------\n\n".join(
-        _USER_PROMPT_RETELL_TEMPLATE.format(url=v[0], text=(v[1] or "")[:per])
-        for v in versions)
-    return _glossary_block(body) + body
+        _USER_PROMPT_RETELL_TEMPLATE.format(url=u, text=" ".join(picked[u]))
+        for u in urls)
+    # Без текста словарь звать нельзя: на пустой строке glossary отдаёт первые
+    # 60 терминов вообще всех, и в промпт уезжает список имён без статьи.
+    return (_glossary_block(body) + body if body else ""), urls
 
 
 def _glossary_block(text):
@@ -788,8 +806,11 @@ def _validate_summary_fast(result: dict) -> tuple[bool, str]:
 # здесь её не перепроверяем — см. п.4a в шапке модуля.
 # ---------------------------------------------------------------------------
 def _retell_article(url: str, versions: list, pub_date: str, attempt_label: str) -> dict | None:
-    user_msg = _retell_sources(versions)
-    urls = [v[0] for v in versions[:config.RETELL_MAX_VERSIONS]]
+    user_msg, urls = _retell_sources(versions)
+    if not user_msg:
+        # Ни в одной версии не нашлось предложения — просить пересказ нечего.
+        log.warning(" %s: пустой промпт, слот пропущен: %s", attempt_label, url)
+        return None
     if len(urls) > 1:
         log.info(" %s: пересказ по %d версиям сюжета", attempt_label, len(urls))
 

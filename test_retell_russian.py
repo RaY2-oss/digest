@@ -138,7 +138,7 @@ def test_abbreviation_glosses_reach_the_prompt():
     едут четвёртой колонкой glossary_abbr.tsv; тест смотрит на весь путь до
     промпта, потому что молчаливая потеря колонки выглядит ровно как «модель
     поленилась»."""
-    src = spm._retell_sources([("https://x.example/1",
+    src, _ = spm._retell_sources([("https://x.example/1",
                                 "TENMAK ve NÜKEN, LGS ve YKS hakkında açıklama yaptı.")])
     for term, gloss in [("TENMAK", "энергетик"), ("LGS", "лицей"), ("YKS", "вуз")]:
         line = next((l for l in src.splitlines() if l.strip().startswith('"%s"' % term.lower())), "")
@@ -148,9 +148,14 @@ def test_abbreviation_glosses_reach_the_prompt():
 def test_glossary_block_does_not_eat_the_article_budget():
     """Словарь едет отдельным куском перед статьями: если он попадёт внутрь
     бюджета символов, длинные сюжеты начнут молча терять хвост."""
-    versions = [("https://o%d.com/1" % i, "z" * 10_000) for i in range(4)]
-    src = spm._retell_sources(versions)
-    assert src.count("z") <= config.RETELL_CHARS_TOTAL, src.count("z")
+    stem = "alpha beta gamma delta epsilon zeta eta theta iota kappa".split()
+    versions = [("https://o%d.com/1" % i,
+                 " ".join(" ".join("%s%d" % (w, i * 1000 + k) for w in stem) + "."
+                          for k in range(200)))
+                for i in range(4)]
+    src, _ = spm._retell_sources(versions)
+    body = "".join(src.split("Article text:\n")[1:])
+    assert len(body) <= config.RETELL_CHARS_TOTAL * 1.05, len(body)
     assert src.count("----------") == 3, "разделитель версий сбился"
 
 
