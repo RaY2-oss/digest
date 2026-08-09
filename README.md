@@ -223,10 +223,13 @@ resources they need live outside either repo:
      run `/rundigest` manually; leave empty to allow everyone.
 3. Edit `config.py`: `QUERIES_GKG` (your own topic/country filters).
 4. `venv/bin/python init_db.py`
-5. Wire up cron: `daily_collector.py` every 6h, `sunday_processor_mmr.py`
-   weekly (`0 17 * * 0` on a UTC host — 20:00 Moscow, so the digest arrives at
-   the end of the weekend and picks up the 12:00 collection),
-   `cleanup_old_articles.py` daily, `telegram_bot_listener.py` as a
+5. Wire up cron: `daily_collector.py` every 6h, and `sunday_processor_mmr.py`
+   chained onto the last Sunday collection in one line — `0 18 * * 0 collector;
+   processor` on a UTC host. Chained rather than given an hour of its own: a
+   collection takes 20–25 minutes and sometimes longer, so any guessed hour
+   either cuts the corpus mid-collection or waits for nothing. The digest goes
+   out around 21:30 Moscow with the freshest week the database has. Also
+   `cleanup_old_articles.py` daily and `telegram_bot_listener.py` as a
    long-running service.
 
 ## Notes
