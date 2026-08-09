@@ -159,6 +159,45 @@ def test_glossary_block_does_not_eat_the_article_budget():
     assert src.count("----------") == 3, "разделитель версий сбился"
 
 
+def test_source_word_in_cyrillic_is_rejected():
+    """09.08.2026 читателю ушло «В Турции увеличен контэнджан стипендиальной
+    программы TENMAK», днём раньше — «контентжант». `kontenjan` по-турецки
+    «квота мест», обычное нарицательное слово, и прежние шесть сторожей такой
+    пункт пропускали: JSON валиден, текст русский, доля кириллицы в норме."""
+    source = ("Article text:\nEnerji Bakanligi TENMAK burs programinda "
+              "kontenjani 300 den 500 e cikardi.")
+    for word in ("контэнджан", "контентжант"):
+        ok, why = spm._validate_summary_fast(
+            {"title": _OK, "summary": "В Турции увеличен %s программы TENMAK." % word},
+            source)
+        assert not ok and "кириллицей вместо перевода" in why, (word, why)
+
+    ok, why = spm._validate_summary_fast(
+        {"title": _OK, "summary": "В Турции увеличена квота стипендиальной программы."},
+        source)
+    assert ok, why
+
+
+def test_borrowed_words_are_not_transliteration():
+    """Порог держится на том, что слово уже живёт в русском: «хакатон» пришёл
+    из чужого языка ровно так же, но пишется по-русски всеми, а «контэнджан» —
+    никем. Если эта половина проверки отвалится, дайджест начнёт браковать
+    половину своей же лексики."""
+    ok, why = spm._validate_summary_fast(
+        {"title": _OK,
+         "summary": "В Анкаре прошёл хакатон для студентов университета."},
+        "Article text:\nAnkarada universite ogrencileri icin hackathon duzenlendi.")
+    assert ok, why
+
+
+def test_guard_stays_quiet_without_the_source():
+    """Сторож сравнивает с текстом источника и без него молчит, а не гадает:
+    вызов из тестов и любой будущий вызов без промпта не должны падать."""
+    ok, why = spm._validate_summary_fast(
+        {"title": _OK, "summary": "В Турции увеличен контэнджан программы."})
+    assert ok, why
+
+
 def test_translation_leg_is_gone():
     """Плечо перевода снято намеренно. Если оно вернётся импортом «чтобы было»,
     воскресный прогон снова потянет 300 МБ модели и снова начнёт портить текст."""
@@ -179,5 +218,8 @@ if __name__ == "__main__":
     test_abbreviation_glosses_reach_the_prompt()
     test_cyrillic_share_ignores_digits_and_punctuation()
     test_glossary_block_does_not_eat_the_article_budget()
+    test_source_word_in_cyrillic_is_rejected()
+    test_borrowed_words_are_not_transliteration()
+    test_guard_stays_quiet_without_the_source()
     test_translation_leg_is_gone()
     print("ok")

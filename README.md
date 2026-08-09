@@ -104,15 +104,27 @@ to repurpose this for a different beat.
    multi-version stories: 313 distinct words and 515 distinct trigrams per
    prompt against 265 and 434 for truncation, in a 22% *shorter* prompt, and
    3.25 outlets represented instead of 2.88.
-5. **Translation to Russian** — the LLM writes English on purpose; the final
-   Russian text comes from a local Marian model (`opus-mt-tc-big-en-zle` via
-   CTranslate2 int8, `translate_ru.py`), run *after* the dedup pass so
-   duplicate detection compares stable English rather than two diverging
-   translations. Proper names go through a shared glossary (`glossary.py`):
-   `keep` terms are masked before translation and restored in Latin script,
-   `ru` terms that leaked through untranslated are replaced with their
-   accepted Russian form. This replaced asking the LLM to transliterate names
-   itself, which it did inconsistently from call to call.
+5. **Russian straight out of the model** — the summary is written in Russian
+   in the same call, and the old leg through a local Marian model was dropped
+   (07.08.2026): two legs meant the translator's own breakage on top of the
+   model's. What the leg used to guarantee is now a prompt rule plus a guard
+   that measures it. Proper names ride into the prompt as a shared glossary
+   (`glossary.py`, symlinked from `gdelt_rss`) and the guards live in
+   `_validate_summary_fast`: mixed scripts inside a word, a third alphabet, a
+   non-Russian Cyrillic language, a summary cut off mid-word — each one is
+   there because that exact thing reached a reader once.
+
+   The newest of them (`translit_guard.py`) catches a foreign *common* noun
+   spelled out in Cyrillic instead of being translated — «В Турции увеличен
+   контэнджан стипендиальной программы» (`kontenjan` is Turkish for a quota of
+   places). Nothing else notices it: the JSON is valid, the text is Russian,
+   the Cyrillic share is fine. The signal is a conjunction, and both halves are
+   needed: the word does not occur in Russian text at all (`wordfreq`) **and**
+   it matches a lowercase Latin word of the source article. The first half
+   alone flags 18% of shipped items (`межсекторального`, `астронавтическом` —
+   ordinary Russian compounds missing from frequency lists), the second alone
+   would flag «университет» next to Turkish `üniversite`. Together, on 487
+   shipped items: two flagged, both the real thing.
 6. **`word_generator.py`** renders the selection to a `.docx`.
 7. **`telegram_sender.py`** delivers it to the configured chat.
 8. **`telegram_bot_listener.py`** — long-polling bot exposing `/rundigest`

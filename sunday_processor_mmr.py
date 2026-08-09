@@ -30,8 +30,9 @@ sunday_processor_mmr.py — воскресная обработка: отбор 
    маркеры словаря нетронутыми, и модель иногда сама выбирает написание
    («şehit» как «шейх»). Лечится списком принятых написаний в промпте, см.
    _glossary_block.
-4a. _validate_summary_fast: regex проверяет формат, долю кириллицы и
-    отсутствие смешения скриптов. При провале — берём следующую статью из
+4a. _validate_summary_fast: regex проверяет формат, долю кириллицы,
+    отсутствие смешения скриптов и то, что слово источника не переписано
+    кириллицей вместо перевода (translit_guard). При провале — берём следующую статью из
     того же регионального пула.
     LLM-проверок темы здесь БОЛЬШЕ НЕТ: релевантность и регион статья получает
     один раз, при сборе (daily_collector._JUDGE_SYSTEM), а два прежних
@@ -91,6 +92,7 @@ import entities
 import importance
 import prefilter
 import retell_select
+import translit_guard
 from model_rotation import _call_openrouter_raw, providers_exhausted
 from word_generator import build_digest
 from telegram_sender import send_document
@@ -565,6 +567,21 @@ inflected for case as Russian grammar requires.
 - When the established Russian form is not obvious, keep the Latin original \
 rather than inventing a transliteration.
 
+Words that are NOT names:
+- A COMMON noun stays a common noun and gets TRANSLATED. Never spell a foreign \
+word out in Cyrillic letters: kontenjan -> «квота мест» (not «контэнджан»), \
+puan -> «балл» (not «пуан»), görevli -> «сотрудник» (not «гёревли»). If you \
+cannot translate it, keep the Latin original and explain it in the same \
+sentence — Cyrillic letters do not make a foreign word Russian, they only hide \
+that it was never translated.
+- An abbreviation written in Latin capitals stays in Latin capitals: MEB, \
+TENMAK, YÖK — never «Меб», never «Тенмак».
+- Text that will physically READ in the source language — an inscription, a \
+sign, a badge, a slogan — keeps its original spelling, with a Russian gloss \
+right after it: надпись «Bahçe Görevlisi» («работник по уходу за территорией»). \
+Putting a Russian phrase in the quotation marks instead invents a quote that \
+nobody will see on the object.
+
 Context for a newcomer:
 - On first mention, expand EVERY abbreviation and add, in the same sentence, a \
 short apposition saying what it is: "Совет по высшему образованию Турции (YÖK)", \
@@ -757,7 +774,7 @@ def _foreign_cyrillic_share(text: str) -> float:
     return sum(c not in _RU_ALPHABET for c in cyr) / len(cyr)
 
 
-def _validate_summary_fast(result: dict) -> tuple[bool, str]:
+def _validate_summary_fast(result: dict, source: str = "") -> tuple[bool, str]:
     title   = result.get("title", "")
     summary = result.get("summary", "")
     full    = f"{title} {summary}"
@@ -797,6 +814,16 @@ def _validate_summary_fast(result: dict) -> tuple[bool, str]:
         return False, (f"пересказ на другом кириллическом языке "
                        f"(нерусских букв {foreign:.0%})")
 
+    # Слово источника, переписанное кириллицей вместо перевода: «увеличен
+    # контэнджан стипендиальной программы» (09.08.2026), «пуаны» вместо баллов.
+    # Промпт это запрещает, но запрет промпта модель соблюдает вероятностно —
+    # см. translit_guard.
+    copied = translit_guard.copied_words(full, source)
+    if copied:
+        w, src = copied[0]
+        return False, (f"слово источника кириллицей вместо перевода: "
+                       f"«{w}» ← {src}")
+
     return True, "ok"
 
 
@@ -814,18 +841,24 @@ def _retell_article(url: str, versions: list, pub_date: str, attempt_label: str)
     if len(urls) > 1:
         log.info(" %s: пересказ по %d версиям сюжета", attempt_label, len(urls))
 
+    hint = ""
     for attempt in range(1, MAX_RETRIES + 1):
         log.info(" %s попытка %d/%d: %s", attempt_label, attempt, MAX_RETRIES, url)
-        raw    = _call_openrouter_raw(_SYSTEM_PROMPT_RETELL, user_msg, ref_url=url)
+        raw    = _call_openrouter_raw(_SYSTEM_PROMPT_RETELL, user_msg + hint, ref_url=url)
         result = _parse_llm_json(raw)
 
         if result is None:
             log.warning(" %s попытка %d: не удалось распарсить JSON", attempt_label, attempt)
             continue
 
-        ok, reason = _validate_summary_fast(result)
+        ok, reason = _validate_summary_fast(result, user_msg)
         if not ok:
             log.warning(" %s попытка %d: %s", attempt_label, attempt, reason)
+            # Повторять тот же промпт — значит надеяться, что модель передумает
+            # сама. Причина отказа уже сформулирована одной строкой, и слот
+            # стоит дороже лишней строки в запросе.
+            hint = ("\n\nПредыдущий ответ забракован: %s. "
+                    "Исправь именно это и перепиши ответ целиком." % reason)
             continue
 
         result["url"]          = url
