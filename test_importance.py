@@ -222,6 +222,24 @@ def test_scale_of_a_story_is_averaged_not_maxed():
     assert scores[1] > scores[0], scores
 
 
+def test_one_outlet_gets_one_vote_on_scale():
+    """Среднее по ВЕРСИЯМ снова отдаёт голоса тому, кто больше опубликовал:
+    сайт, выложивший новость и её же обновление, отвечает судье дважды одним и
+    тем же текстом. Голос считается по изданию — как охват и как рёбра
+    LexRank. За неделю 09.08.2026 таких сюжетов 75 из 725."""
+    vecs = _orthogonal(2)
+    # Одно издание в четыре захода зовёт событие мелким, второе — крупным.
+    loud = _story([_art("https://o.com/%d" % k, vecs[0], 0.0, 1) for k in range(4)]
+                  + [_art("https://x.com/1", vecs[0], 0.0, 3)])
+    assert spm._story_scale(loud) == 0.5, spm._story_scale(loud)
+
+    # Перепечатка сети (один материал под шестью доменами) — тоже один голос.
+    wire = _story([_art("https://%s/news/2792127/x" % h, vecs[1], 0.0, 1)
+                   for h in ("chinanationalnews.com", "shanghaisun.com")]
+                  + [_art("https://x.com/2", vecs[1], 0.0, 3)])
+    assert spm._story_scale(wire) == 0.5, spm._story_scale(wire)
+
+
 def test_ungraded_articles_neither_win_nor_lose():
     """Колонка scale заполняется только новыми прогонами коллектора, так что
     неделя после выкатки будет смешанной. Старая строка без оценки обязана
@@ -291,6 +309,7 @@ def demo():
     test_wire_mirrors_do_not_inflate_coverage()
     test_scale_lifts_the_national_event_over_the_routine()
     test_scale_of_a_story_is_averaged_not_maxed()
+    test_one_outlet_gets_one_vote_on_scale()
     test_ungraded_articles_neither_win_nor_lose()
     test_coverage_scale_is_relative_to_the_basket()
     test_group_stories_collapses_reprints()

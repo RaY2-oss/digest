@@ -98,9 +98,15 @@ def test_docx_lists_every_source_url(tmp="/tmp"):
             "publish_date": "2026-07-27",
         }])
         from docx import Document
-        text = "\n".join(p.text for p in Document(path).paragraphs)
+        paras = [p.text for p in Document(path).paragraphs]
+        text = "\n".join(paras)
         for u in ("https://a.com/1", "https://b.com/1", "https://c.com/1"):
             assert u in text, f"{u} потерян в документе"
+        # ...и все в ОДНОЙ строке через точку с запятой: тремя абзацами подряд
+        # ссылки занимали под сюжетом больше места, чем сам пересказ.
+        line = next(p for p in paras if p.startswith("URL: "))
+        assert line == ("URL: https://a.com/1; https://b.com/1; "
+                        "https://c.com/1"), line
     finally:
         config.OUTPUT_DIR = old_out
 
@@ -143,8 +149,56 @@ def test_story_date_is_the_earliest_reprint():
     assert spm._story_date(blank, "2026-08-01") == "2026-08-01"
 
 
+def test_event_date_wins_only_when_it_checks_out():
+    """Дату события называет модель, а печатается она, только если сторож её
+    подтвердил: в недельном окне, не позже публикации и буквально стоящая в
+    тексте. Иначе в шапке пункта остаётся дата публикации.
+
+    Проверяется весь путь до словаря пункта: событие, о котором написали через
+    три дня, и есть тот случай, ради которого поле заведено."""
+    import datetime
+
+    import event_date
+
+    day = datetime.date.today()
+    ev_d = day - datetime.timedelta(days=3)
+    ev = ev_d.isoformat()
+    pub = (day - datetime.timedelta(days=1)).isoformat()
+    # В тексте дата стоит так, как её пишет издание, — днём вперёд и без
+    # ведущего нуля; сторож обязан узнать и такое написание.
+    text = ("Konferans %d.%d.%d tarihinde Ankarada duzenlendi ve katilimcilar "
+            "ilgi gosterdi bilim insanlari." % (ev_d.day, ev_d.month, ev_d.year))
+
+    real = spm._call_openrouter_raw
+    try:
+        spm._call_openrouter_raw = lambda s, u, ref_url=None: (
+            '{"title": "В Турции прошла конференция по науке", '
+            '"summary": "В Анкаре прошла научная конференция исследователей.", '
+            '"event_date": "%s"}' % ev)
+        got = spm._retell_article("https://a.com/1", [("https://a.com/1", text)],
+                                  pub, "тест")
+        assert got and got["publish_date"] == ev, got
+
+        # Та же дата, но в тексте её нет — печатается публикация.
+        spm._call_openrouter_raw = lambda s, u, ref_url=None: (
+            '{"title": "В Турции прошла конференция по науке", '
+            '"summary": "В Анкаре прошла научная конференция исследователей.", '
+            '"event_date": "%s"}'
+            % (day - datetime.timedelta(days=2)).isoformat())
+        got = spm._retell_article("https://a.com/1", [("https://a.com/1", text)],
+                                  pub, "тест")
+        assert got and got["publish_date"] == pub, got
+    finally:
+        spm._call_openrouter_raw = real
+
+    # Потолок недели держится и без всякой модели.
+    assert event_date.clamp((day - datetime.timedelta(days=30)).isoformat(),
+                            day) == ""
+
+
 if __name__ == "__main__":
     test_story_date_is_the_earliest_reprint()
+    test_event_date_wins_only_when_it_checks_out()
     test_single_version_fills_the_whole_budget()
     test_several_versions_share_the_budget()
     test_reprints_do_not_eat_the_budget_twice()

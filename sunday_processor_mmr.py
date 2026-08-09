@@ -40,6 +40,13 @@ sunday_processor_mmr.py — воскресная обработка: отбор 
     самое теми же критериями — и оба были fail-open, т.е. при мёртвых провайдерах
     молча пропускали всё. Стоили они по вызову на кандидата и по вызову на
     попытку: 492 + ~500 обращений за прогон 2026-07-28 при квоте порядка тысячи.
+4b. Дата пункта — дата СОБЫТИЯ, а не публикации: её называет та же LLM тем же
+    вызовом (поле event_date), а печатается она, только если её подтвердил
+    сторож event_date.choose — дата в недельном окне, не позже первой
+    публикации и буквально стоящая в тексте, который модель читала. Не
+    подтвердилась — остаётся дата первой перепечатки (_story_date). Старше
+    недели в дайджест не попадает ничего: потолок стоит и в выборке (SQL), и
+    на печати (event_date.clamp).
 5. _postprocess_digest — LLM-редактор снимает дубликаты одного события.
    Отдельного шага перевода больше нет: п.4 уже отдаёт русский текст.
 6. build_digest() -> .docx.
@@ -84,11 +91,13 @@ import re
 import sqlite3
 import sys
 import unicodedata
+from datetime import date
 
 import numpy as np
 
 import config
 import entities
+import event_date
 import importance
 import prefilter
 import retell_select
@@ -264,18 +273,37 @@ def _story_scale(art: tuple):
     наверняка — и максимум превращает фактор в тот же охват, только шумный.
     Среднее пользуется перепечатками ровно наоборот: это несколько независимых
     оценок одного события, и разброс судьи они гасят.
+
+    Независимых — поэтому голос считается ПО ИЗДАНИЮ, а не по версии: сайт,
+    выложивший новость и её же обновление, судью не переспрашивает, он повторяет
+    один и тот же текст, и судья отвечает на него одинаково. Так же считается
+    охват (importance.publisher) и так же обнулены внутридоменные рёбра
+    LexRank — масштаб был последним фактором, где одно издание голосовало
+    столько раз, сколько опубликовало. За неделю 09.08.2026 две версии одного
+    издания несут 75 сюжетов из 725, масштаб сдвигается у 26, в среднем на
+    0.062 и до 0.225 — при весе 0.40 этого хватает на пару мест в отборе.
     """
-    vals = [_SCALE_VALUE[v[6]] for v in _versions(art) if v[6] in _SCALE_VALUE]
-    return sum(vals) / len(vals) if vals else None
+    by_pub = {}
+    for v in _versions(art):
+        if v[6] in _SCALE_VALUE:
+            by_pub.setdefault(importance.publisher(v[0]), []).append(
+                _SCALE_VALUE[v[6]])
+    if not by_pub:
+        return None
+    return sum(sum(g) / len(g) for g in by_pub.values()) / len(by_pub)
 
 
 def _story_date(art: tuple, fallback: str) -> str:
-    """Дата сюжета — самая ранняя из дат его версий.
+    """Дата ПУБЛИКАЦИИ сюжета — самая ранняя из дат его версий.
 
-    Даты события у нас нет и взять её неоткуда: и GKG, и разметка страницы
-    отвечают на вопрос «когда опубликовано». Но перепечатки одного сюжета
-    растянуты на несколько дней, и первая из них — ближайшее к событию, что
-    даёт корпус: первое издание пишет по факту, а не через неделю.
+    Ни GKG, ни разметка страницы даты события не знают: оба отвечают на вопрос
+    «когда опубликовано». Но перепечатки одного сюжета растянуты на несколько
+    дней, и первая из них — ближайшее к событию, что даёт корпус: первое
+    издание пишет по факту, а не через неделю.
+
+    Саму дату события называет модель при пересказе, и печатается она, только
+    если её подтвердил сторож (event_date.choose); эта дата — запасной вариант
+    и потолок: позже неё событие быть не может.
 
     Пустые даты в счёт не идут (у части статей publish_date не определился);
     если их нет ни у одной версии, остаётся дата представителя.
@@ -632,8 +660,22 @@ into two sentences merely because they are adjacent.
 conditions, quotes. What every outlet repeats is the headline the reader can \
 guess; what one outlet adds is why several of them were read at all.
 
+Date of the event:
+- "event_date" is the day the event REPORTED here actually happened, exactly as \
+the article states it: "29 Temmuz'da düzenlenen zirve" -> "2026-07-29". \
+The year is usually omitted in the text — take it from the article URL or the \
+publication date.
+- Give the date ONLY if the article names it. Never infer it from the \
+publication date, never guess, never use a date the article mentions for \
+something else (a deadline, an anniversary, a previous event, a schedule). \
+When in doubt return null — null costs nothing, a wrong date is printed in the \
+digest as a fact.
+- A future date is not an event date: "applications close on 1 September" is a \
+deadline, not the day something happened. Return null for those.
+- For a multi-day event give its FIRST day.
+
 Return ONLY valid JSON, no markdown fences:
-{"title": "<заголовок по-русски>", "summary": "<пересказ по-русски, 3–4 предложения, один абзац>"}
+{"title": "<заголовок по-русски>", "summary": "<пересказ по-русски, 3–4 предложения, один абзац>", "event_date": "YYYY-MM-DD или null"}
 """
 
 _USER_PROMPT_RETELL_TEMPLATE = "Article URL: {url}\nArticle text:\n{text}"
@@ -861,9 +903,21 @@ def _retell_article(url: str, versions: list, pub_date: str, attempt_label: str)
                     "Исправь именно это и перепиши ответ целиком." % reason)
             continue
 
+        # Дата события: её называет модель, но печатается она только пройдя
+        # сторожа (event_date) — в недельном окне, не позже публикации и
+        # буквально стоящая в тексте, который модель читала.
+        day, why = event_date.choose(result.get("event_date"), pub_date,
+                                     user_msg, date.today())
+        if why:
+            log.info(" %s: дата события отклонена (%s), остаётся публикация %s",
+                     attempt_label, why, pub_date)
+        elif day and day != (pub_date or "")[:10]:
+            log.info(" %s: дата события %s вместо публикации %s",
+                     attempt_label, day, pub_date)
+
         result["url"]          = url
         result["urls"]         = urls      # все источники, попавшие в промпт
-        result["publish_date"] = pub_date
+        result["publish_date"] = day
         return result
 
     log.error(" %s: все %d попытки исчерпаны", attempt_label, MAX_RETRIES)

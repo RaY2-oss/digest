@@ -103,11 +103,12 @@ def build_digest(summaries):
 
         # Источников может быть несколько: пересказ сюжета собирается по всем
         # перепечаткам, попавшим в промпт, и все они должны быть проверяемы.
-        for n, u in enumerate(urls):
-            if not u:
-                continue
+        # Идут одной строкой через «; »: с новой строки каждый занимал под
+        # сюжетом больше места, чем сам пересказ.
+        live = [u for u in urls if u]
+        if live:
             p_url = doc.add_paragraph()
-            r_url = p_url.add_run(f"{'URL' if n == 0 else '   '}: {u}")
+            r_url = p_url.add_run("URL: " + "; ".join(live))
             r_url.italic = True
             r_url.font.size = Pt(10)
 
