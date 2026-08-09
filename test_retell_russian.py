@@ -198,6 +198,35 @@ def test_guard_stays_quiet_without_the_source():
     assert ok, why
 
 
+def test_inscription_must_be_copied_letter_for_letter():
+    """Пункт 2 дайджеста от 09.08.2026: в источнике на форме написано «Bahçe
+    Görevlisi», а читателю ушло «Bahçe Görevli». Промпт велит переносить надпись
+    из источника как есть — «как есть» модель понимает приблизительно: там же
+    «Üniversite» вышла как «Universite», а «Üniversitesi» — как «University».
+    Сверка идёт целыми словами: обрезанный хвост прошёл бы как подстрока."""
+    source = ("Article text:\nOkul güvenliklerinin kıyafetleri üzerinde "
+              "“Bahçe Görevlisi” veya “Okul Görevlisi” ibareleri yer alacak.")
+    ok, why = spm._validate_summary_fast(
+        {"title": _OK,
+         "summary": "Охранники получат форму с надписью «Bahçe Görevli»."}, source)
+    assert not ok and "надпись не из источника" in why, why
+
+    ok, why = spm._validate_summary_fast(
+        {"title": _OK,
+         "summary": "Охранники получат форму с надписью «Bahçe Görevlisi» "
+                    "(«работник по уходу за территорией»)."}, source)
+    assert ok, why
+
+
+def test_russian_quotes_are_not_checked_against_the_source():
+    """Сверяется только латиница: русский текст в кавычках — это перевод, и
+    дословно в турецком источнике его нет и быть не может."""
+    ok, why = spm._validate_summary_fast(
+        {"title": _OK, "summary": "Программу назвали «поддержкой при выборе вуза»."},
+        "Article text:\nÜniversite Tercih Destek Programı düzenlendi.")
+    assert ok, why
+
+
 def test_translation_leg_is_gone():
     """Плечо перевода снято намеренно. Если оно вернётся импортом «чтобы было»,
     воскресный прогон снова потянет 300 МБ модели и снова начнёт портить текст."""
@@ -221,5 +250,7 @@ if __name__ == "__main__":
     test_source_word_in_cyrillic_is_rejected()
     test_borrowed_words_are_not_transliteration()
     test_guard_stays_quiet_without_the_source()
+    test_inscription_must_be_copied_letter_for_letter()
+    test_russian_quotes_are_not_checked_against_the_source()
     test_translation_leg_is_gone()
     print("ok")

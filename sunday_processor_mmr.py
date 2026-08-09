@@ -819,6 +819,30 @@ def _foreign_cyrillic_share(text: str) -> float:
     return sum(c not in _RU_ALPHABET for c in cyr) / len(cyr)
 
 
+# Латиница в кавычках — надпись, вывеска, официальное название: промпт велит
+# переносить её из источника буква в букву и пояснять по-русски рядом. «Как
+# есть» модель понимает приблизительно: турецкое «Bahçe Görevlisi» вышло в
+# дайджест 09.08.2026 как «Bahçe Görevli» — надписи с таким текстом не
+# существует. Сверяем целыми словами: обрезанный хвост иначе прошёл бы как
+# подстрока.
+_QUOTED = re.compile(r"[«\"“]([^«»\"“”\n]{2,60})[»\"”]")
+
+
+def _quote_not_in_source(text: str, source: str) -> str:
+    """Первая закавыченная латинская вставка, которой нет в источнике.
+
+    Без источника молчит, а не бракует всё подряд: сравнивать не с чем.
+    """
+    for m in _QUOTED.finditer(text) if source else ():
+        frag = " ".join(m.group(1).split())
+        if not frag or _cyrillic_share(frag) > 0.2:
+            continue
+        pat = r"(?<!\w)%s(?!\w)" % r"\s+".join(re.escape(w) for w in frag.split())
+        if not re.search(pat, source, re.I):
+            return frag
+    return ""
+
+
 def _validate_summary_fast(result: dict, source: str = "") -> tuple[bool, str]:
     title   = result.get("title", "")
     summary = result.get("summary", "")
@@ -868,6 +892,10 @@ def _validate_summary_fast(result: dict, source: str = "") -> tuple[bool, str]:
         w, src = copied[0]
         return False, (f"слово источника кириллицей вместо перевода: "
                        f"«{w}» ← {src}")
+
+    quote = _quote_not_in_source(full, source)
+    if quote:
+        return False, f"надпись не из источника: «{quote}»"
 
     return True, "ok"
 

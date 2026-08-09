@@ -11,7 +11,7 @@ telegram_bot_listener.py — long-polling бот: ручной запуск да
                   одного и того же сообщения, а не лентой новых
     /digests    — последние готовые дайджесты кнопками, каждый со временем МСК
     /last       — самый свежий готовый дайджест
-    /status     — идёт ли прогон и когда собран последний дайджест
+    /status     — на каком этапе прогон и когда собран последний дайджест
     /resetlock  — снять зависшую блокировку
     /help       — то же меню
 
@@ -43,7 +43,10 @@ POLL_TIMEOUT = 30  # long-polling таймаут для getUpdates, сек
 MSK = ZoneInfo("Europe/Moscow")
 ARCHIVE_MAX = 8       # столько прошлых дайджестов показываем кнопками
 EDIT_EVERY = 3.0      # с: Telegram режет частые правки одного сообщения
-BAR_WIDTH = 12
+# Клеток в полосе — по одной на сюжет. Фиксированная ширина читалась как
+# второй счётчик: на «сюжет 3 из 20» полоса из двенадцати клеток выглядит как
+# «из 12». Потолок — чтобы строка не переносилась на телефоне.
+BAR_MAX = 20
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +105,29 @@ def send_file(chat_id, path, caption):
 
 def is_running():
     return os.path.exists(LOCK_PATH)
+
+
+def _lock_write(started, stage):
+    """Лок заодно несёт состояние прогона.
+
+    /status обрабатывается в потоке polling, а прогон идёт в своём — общей
+    памяти между ними нет по той же причине, по какой сам лок файловый.
+    """
+    try:
+        with open(LOCK_PATH, "w", encoding="utf-8") as f:
+            f.write("%d\n%s" % (started, stage))
+    except OSError:
+        pass
+
+
+def _lock_read():
+    """(время старта, этап) или (None, None) — для пустого лока с прошлых версий."""
+    try:
+        with open(LOCK_PATH, encoding="utf-8") as f:
+            started, _, stage = f.read().partition("\n")
+        return float(started), stage
+    except (OSError, ValueError):
+        return None, None
 
 
 VENV_PYTHON = os.path.join(os.path.dirname(__file__), "venv", "bin", "python3")
@@ -185,27 +211,71 @@ def _articles_note(stdout):
     return f" Статей: {m.group(1)}."
 
 
-def _bar(done, total, width=BAR_WIDTH):
+def _bar(done, total):
+    width = min(BAR_MAX, max(1, total))
     filled = max(0, min(width, round(width * done / max(1, total))))
     return "▰" * filled + "▱" * (width - filled)
 
 
-def progress_text(stage, started):
+def _elapsed(started):
+    mins = int((time.time() - started) // 60)
+    return "прошло %d мин" % mins if mins else "только начали"
+
+
+def progress_text(stage, started, counts=None):
     """Текст сообщения о ходе прогона.
 
-    Полоса рисуется только там, где есть «N из M»: пересказ занимает почти всё
-    время прогона, и на остальных этапах полоса врала бы о том, сколько
-    осталось.
+    Полоса появляется на первом же «N из M» и дальше не убирается: пересказ
+    занимает почти всё время прогона, и полоса, исчезнувшая на следующем
+    этапе, читается как сброс, а не как «эта часть позади».
     """
-    mins = int((time.time() - started) // 60)
     lines = ["⚙️ Собираю дайджест", "", "▸ %s" % stage]
-    m = _OF.search(stage)
-    if m:
-        done, total = int(m.group(1)), int(m.group(2))
-        lines.append("%s %d/%d" % (_bar(done, total), done, total))
+    if counts:
+        lines.append("%s %d/%d" % (_bar(*counts), counts[0], counts[1]))
     lines.append("")
-    lines.append("прошло %d мин" % mins if mins else "только начали")
+    lines.append(_elapsed(started))
     return "\n".join(lines)
+
+
+class Progress(threading.Thread):
+    """Правит одно сообщение о ходе прогона, пока идёт subprocess.
+
+    Отдельным потоком, а не правкой по приходу этапа: между сюжетами проходят
+    минуты, и throttle «не чаще EDIT_EVERY» ронял как раз последнюю правку
+    перед такой паузой — сообщение молча показывало предыдущий сюжет и стоящий
+    счётчик минут. Здесь наоборот: поток шлёт всё, что изменилось, и ничего,
+    что не изменилось, так что минуты тикают сами, а лишних правок нет.
+    """
+
+    def __init__(self, chat_id, msg_id, started):
+        super().__init__(daemon=True)
+        self.chat_id, self.msg_id, self.started = chat_id, msg_id, started
+        self.stage = "запускаюсь"
+        self.counts = None
+        self._sent = None
+        # Не _stop: так называется внутренний метод threading.Thread, и join()
+        # падает на нём с «'Event' object is not callable».
+        self._over = threading.Event()
+
+    def set_stage(self, stage):
+        """Вызывается из потока, читающего stdout прогона."""
+        self.stage = stage
+        m = _OF.search(stage)
+        if m:
+            self.counts = (int(m.group(1)), int(m.group(2)))
+        _lock_write(self.started, stage)
+
+    def run(self):
+        while not self._over.wait(EDIT_EVERY):
+            text = progress_text(self.stage, self.started, self.counts)
+            if text != self._sent:
+                self._sent = text
+                edit_message(self.chat_id, self.msg_id, text)
+
+    def finish(self, text):
+        self._over.set()
+        self.join(timeout=EDIT_EVERY + 5)
+        edit_message(self.chat_id, self.msg_id, text)
 
 
 def run_processor(chat_id):
@@ -214,14 +284,16 @@ def run_processor(chat_id):
                               "блокировку командой /resetlock.")
         return
 
-    open(LOCK_PATH, "w").close()
     started = time.time()
+    _lock_write(started, "запускаюсь")
     msg_id = send_message(chat_id, progress_text("запускаюсь", started))
     log.info("Ручной запуск sunday_processor_mmr.py инициирован из чата %s", chat_id)
 
     env = os.environ.copy()
     env["TARGET_CHAT_ID"] = str(chat_id)
 
+    prog = Progress(chat_id, msg_id, started)
+    prog.start()
     try:
         # stderr сведён в stdout намеренно: труба на 64 КБ, и никем не читаемый
         # stderr рано или поздно упрётся в неё и подвесит прогон целиком.
@@ -232,30 +304,26 @@ def run_processor(chat_id):
             text=True, env=env,
         )
         out = []
-        last_edit = 0.0
         for line in proc.stdout:
             out.append(line)
             m = _STAGE.match(line.strip())
-            # Правка сообщения — сетевой вызов, и этапы идут пачками; чаще, чем
-            # раз в EDIT_EVERY, Telegram их всё равно не примет.
-            if m and time.time() - last_edit >= EDIT_EVERY:
-                last_edit = time.time()
-                edit_message(chat_id, msg_id, progress_text(m.group(1), started))
+            if m:
+                prog.set_stage(m.group(1))
         code = proc.wait()
         stdout = "".join(out)
 
         mins = max(1, int((time.time() - started) // 60))
         if code == 0:
-            edit_message(chat_id, msg_id,
-                         "✅ Дайджест собран и отправлен.%s Заняло %d мин."
-                         % (_articles_note(stdout), mins))
+            prog.finish("✅ Дайджест собран и отправлен.%s Заняло %d мин.\n"
+                        "Файл — /last, прошлые — /digests."
+                        % (_articles_note(stdout), mins))
         else:
             log.error("sunday_processor_mmr завершился с ошибкой: %s", stdout[-2000:])
-            edit_message(chat_id, msg_id,
-                         "❌ Прогон оборвался. Смотрите logs/processor.log.")
+            prog.finish("❌ Прогон оборвался на этапе «%s». "
+                        "Смотрите logs/processor.log." % prog.stage)
     except Exception as exc:
         log.error("Исключение при запуске: %s", exc)
-        edit_message(chat_id, msg_id, "❌ Непредвиденная ошибка: %s" % exc)
+        prog.finish("❌ Непредвиденная ошибка: %s" % exc)
     finally:
         if os.path.exists(LOCK_PATH):
             os.remove(LOCK_PATH)
@@ -278,9 +346,17 @@ _MENU = (
 
 
 def send_status(chat_id):
+    """Что происходит сейчас. Этап знаем только у прогонов, поднятых ботом:
+    воскресный cron запускает обработчик мимо лока, и для него это просто
+    «прогон не идёт» — дайджест придёт сам."""
     items = archive()
     last = "последний готовый: %s" % msk(items[0][1]) if items else "готовых пока нет"
-    head = "⚙️ Прогон идёт прямо сейчас." if is_running() else "💤 Прогон не идёт."
+    if is_running():
+        started, stage = _lock_read()
+        head = "⚙️ Идёт прогон: %s" % (stage or "запускается")
+        head += " (%s)." % _elapsed(started) if started else "."
+    else:
+        head = "💤 Прогон не идёт."
     send_message(chat_id, "%s\n%s\nВсего сохранено дайджестов: %d."
                  % (head, last, len(archive(limit=10 ** 6))))
 
@@ -338,6 +414,9 @@ def handle_update(update):
     elif text.startswith("/start") or text.startswith("/help"):
         send_message(chat_id, _MENU)
 
+    elif text.startswith("/"):
+        send_message(chat_id, "Такой команды у меня нет.\n\n" + _MENU)
+
 
 def main():
     """Бесконечный long-polling цикл getUpdates. offset = update_id последнего
@@ -376,5 +455,37 @@ def main():
             time.sleep(5)
 
 
+def _selfcheck():
+    """python3 telegram_bot_listener.py --selfcheck — без сети и без Telegram."""
+    assert _bar(0, 20) == "▱" * 20
+    assert _bar(3, 20) == "▰" * 3 + "▱" * 17, "клетка на сюжет, а не 12 на всё"
+    assert _bar(20, 20) == "▰" * 20
+    assert _bar(1, 1) == "▰"
+
+    # Полоса берётся из counts и живёт дальше этапа, где встретилось «N из M».
+    now = time.time()
+    assert "▰" not in progress_text("Читаю статьи за неделю", now)
+    assert "3/20" in progress_text("Пересказываю сюжет 3 из 20", now, (3, 20))
+    assert "20/20" in progress_text("Свожу дубликаты", now, (20, 20))
+
+    # Минуты меняют текст сами — на этом держится heartbeat: поток шлёт правку
+    # только при изменении, и без тикающих минут сообщение бы застыло.
+    assert progress_text("x", now) != progress_text("x", now - 61)
+
+    started = int(now)
+    _lock_write(started, "Пересказываю сюжет 7 из 20")
+    assert _lock_read() == (float(started), "Пересказываю сюжет 7 из 20")
+    open(LOCK_PATH, "w").close()          # лок прошлых версий — пустой
+    assert _lock_read() == (None, None)
+    os.remove(LOCK_PATH)
+    assert _lock_read() == (None, None)   # лока нет вовсе
+
+    print("selfcheck ok")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--selfcheck" in sys.argv:
+        _selfcheck()
+    else:
+        main()
