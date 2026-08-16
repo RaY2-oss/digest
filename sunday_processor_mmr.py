@@ -117,6 +117,18 @@ from telegram_sender import send_document
 
 MAX_RETRIES = 3
 
+# Проверочный прогон: собрать .docx и НЕ рассылать его подписчикам.
+#
+# Заведено 16.08.2026: проверка правок требует настоящего прогона, а каждый
+# прогон уходил живым людям в Telegram. Пять проверок за день — пять лишних
+# документов у всех получателей. Тестировать на живой рассылке нельзя.
+#
+# Под флагом пропускается ДВА действия, а не одно: отправка и cleanup_old().
+# Чистка базы — тоже необратимый побочный эффект, а проверочный прогон обязан
+# быть безвредным. Всё остальное (отбор, пересказ, сторожа, постобработка,
+# сборка .docx) идёт как в боевом режиме — иначе проверка ничего не проверяет.
+NO_SEND = ("--no-send" in sys.argv) or os.environ.get("DIGEST_NO_SEND") == "1"
+
 # ---------------------------------------------------------------------------
 # Логирование
 # ---------------------------------------------------------------------------
@@ -1064,6 +1076,11 @@ def _validate_summary_fast(result: dict, source: str = "") -> tuple[bool, str]:
     if study:
         return False, f"«изучение» без объекта: «{study}» (нужно обучение/учёба)"
 
+    exo = ru_guard.wrong_exonym(full, source)
+    if exo:
+        return False, ("принятое написание подменено: «%s» вместо «%s» (%s)"
+                       % (exo[0], exo[2], exo[1]))
+
     third = _third_script_letters(full)
     if third:
         return False, f"третий алфавит в тексте: «{''.join(third[:12])}»"
@@ -1541,18 +1558,23 @@ def main():
         docx_path = build_digest(summaries)
         log.info("Документ сохранён: %s", docx_path)
 
-        stage("Отправляю")
-        target_chat_id = os.environ.get("TARGET_CHAT_ID")
-        ok = send_document(
-            docx_path,
-            chat_id=int(target_chat_id) if target_chat_id else None,
-        )
-        if ok:
-            log.info("Документ отправлен в Telegram.")
+        if NO_SEND:
+            stage("Проверочный прогон — не отправляю")
+            log.warning("--no-send: документ собран, но НЕ отправлен и база не "
+                        "чистилась. Файл: %s", docx_path)
         else:
-            log.error("Не удалось отправить документ в Telegram (см. errors.log).")
+            stage("Отправляю")
+            target_chat_id = os.environ.get("TARGET_CHAT_ID")
+            ok = send_document(
+                docx_path,
+                chat_id=int(target_chat_id) if target_chat_id else None,
+            )
+            if ok:
+                log.info("Документ отправлен в Telegram.")
+            else:
+                log.error("Не удалось отправить документ в Telegram (см. errors.log).")
 
-        cleanup_old(conn)
+            cleanup_old(conn)
         # Машиночитаемый итог в stdout: telegram_bot_listener читает его, чтобы
         # не отвечать бодрым "✅ сформирован", когда слотов набралось 5 из 20.
         print(f"DIGEST_ARTICLES={len(summaries)}/{target}", flush=True)

@@ -29,6 +29,7 @@
 Дети» — разные предложения, «высшее и» — союз, разобранный как
 существительное.
 """
+import difflib
 import re
 import threading
 
@@ -180,6 +181,68 @@ def study_without_object(text: str) -> str | None:
     """
     m = _STUDY_PLACE.search(text or "")
     return m.group(0) if m else None
+
+
+_EXONYM_WORD = re.compile(r"[А-ЯЁ][А-Яа-яЁё]{3,}")
+_EXONYM_RATIO = 0.88
+
+
+def wrong_exonym(text: str, source: str) -> tuple[str, str, str] | None:
+    """Принятое написание имени подменено прямой передачей из источника.
+
+    16.08.2026 читателю ушло «в университетах Анкары, Стамбула, Антальи и
+    Истанбула» — модель выдала и принятую форму, и кальку с турецкого, приняв
+    их за два разных города. Раньше туда же уезжало «Храздан» вместо
+    «Раздана».
+
+    Правило опирается на САМ словарь, а не на рукописный список исключений: у
+    записи с режимом ru есть и исходная форма (istanbul), и принятая русская
+    (Стамбул). Брак — кириллическое слово, похожее на ИСХОДНУЮ форму и НЕ
+    похожее на принятую. Склонение принятой формы («Ширнаке» от «Ширнак»)
+    под правило не попадает: оно похоже на принятую, а это проверяется явно.
+    Записи, где исходная и принятая пишутся одинаково, пропускаются — там
+    спорить не о чем.
+
+    Смотрим только те записи словаря, чья исходная форма ЕСТЬ в источнике:
+    иначе сторож начнёт судить о словах, которых модель не читала.
+
+    Замер по всем отгруженным дайджестам, у которых источник ещё в базе
+    (119 пунктов): четыре срабатывания, все четыре — настоящий брак
+    («Истанбуле» трижды, «Храздане» однажды). Ложных нет.
+    """
+    if not text or not source:
+        return None
+    try:
+        import glossary
+        import translit_guard
+    except Exception:  # noqa: BLE001
+        return None
+    seen = set()
+    for _s, _e, key, dst, mode in glossary.find_all(source):
+        if mode != "ru" or key in seen:
+            continue
+        seen.add(key)
+        k_sk = translit_guard.skeleton(key.replace(" ", ""))
+        d_sk = translit_guard.skeleton(dst.replace(" ", ""))
+        if not k_sk or not d_sk or k_sk == d_sk:
+            continue
+        for w in _EXONYM_WORD.findall(text):
+            w_sk = translit_guard.skeleton(w)
+            # Похоже либо по целому слову (склонение: «Истанбуле»), либо по
+            # ОСНОВЕ (производное прилагательное: «Истанбулский»). Одного
+            # коэффициента похожести мало: у прилагательного суффикс съедает
+            # долю совпадения и «Истанбулский» против istanbul даёт 0.80 —
+            # ниже порога. Основу проверяем от пяти букв, чтобы короткие
+            # ключи не хватали случайные слова.
+            like_key = (difflib.SequenceMatcher(None, w_sk, k_sk).ratio() >= _EXONYM_RATIO
+                        or (len(k_sk) >= 5 and w_sk.startswith(k_sk)))
+            if not like_key:
+                continue
+            like_dst = (difflib.SequenceMatcher(None, w_sk, d_sk).ratio() >= _EXONYM_RATIO
+                        or (len(d_sk) >= 5 and w_sk.startswith(d_sk)))
+            if not like_dst:
+                return w, key, dst
+    return None
 
 
 def _skeleton(word: str) -> str:
