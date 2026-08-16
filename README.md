@@ -284,6 +284,21 @@ decision from "raise relevance" and belongs to the owner, not to a weight.
 faked: every automatic stand-in for relevance here is built out of the same
 factors being judged and would only measure itself.
 
+### Language labels are cosmetic
+
+`articles.language` is written by `detect_text_language` and read by exactly
+one thing: a `lang=xx: N` line in the collector log. No prompt, glossary,
+translation, prefilter or importance factor touches it — `load_week_articles`
+does not even select the column.
+
+That was worth checking, because 46 Armenian (`1in.am`, `panorama.am`) and
+Georgian (`sputnik-georgia.com`) pages carry `language='et'`. It is not a bug
+in our code: `langdetect` ships 55 profiles and neither `hy` nor `ka` is among
+them, so it has to put those scripts somewhere. Left as is — a label nobody
+reads cannot corrupt anything. If it ever gains a reader, get a detector that
+knows those scripts first (both have their own alphabet, a Unicode range check
+is enough) and only then rely on it.
+
 ## Shared with `gdelt_rss`
 
 Two modules are not copies but symlinks into the sibling project, which owns

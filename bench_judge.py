@@ -107,6 +107,35 @@ _USER_V2 = (
 )
 
 
+# Та же пятибалльная шкала, но признаками вместо якорей — как в v1, только
+# делений пять. Нужна ровно для одного вопроса: распределение выровняли якоря
+# или само число делений? Без неё v2 меняет четыре вещи разом и непонятно, за
+# какую платить сопровождением (якоря надо пересматривать, когда меняется
+# повестка; лишнее деление — нет).
+_SCALE_V2A = (
+    "Then rate how much the event CHANGES the country's science, education or "
+    "youth system, on a scale of 1 to 5:\n"
+    "  5 - a law or reform adopted, a national programme launched, an "
+    "intergovernmental agreement signed, a new national university or "
+    "laboratory opened, national statistics or a country-wide ranking "
+    "published;\n"
+    "  4 - a country-wide programme or body is created or funded while the "
+    "existing rules stay;\n"
+    "  3 - a real change inside ONE institution or ONE sector, with money or "
+    "obligations behind it;\n"
+    "  2 - such a change is announced or prepared, or the numbers of a regular "
+    "process are published;\n"
+    "  1 - nothing in the system changes: a meeting, a visit, a forum, a "
+    "competition or its results, a corporate or charitable initiative, and any "
+    "seasonal or annual routine.\n"
+    "\n"
+    "A ministry, a minister or a national company as the ACTOR does not by "
+    "itself raise the level, and neither does the fact that something happens "
+    "across the whole country. Ask what would be DIFFERENT in the country if "
+    "this news had not happened.\n"
+)
+
+
 def prompts(variant):
     """-> (system, user_template, число делений шкалы)."""
     import daily_collector as D
@@ -116,7 +145,8 @@ def prompts(variant):
     # спор идёт только о шкале. Меняем ровно её, иначе непонятно, что подействовало.
     head = D._JUDGE_SYSTEM.split("Right after the region, append ONE digit")[0]
     tail = "The article may be in any language — judge by content, not language."
-    return head + _SCALE_V2 + "\n" + tail, _USER_V2, 5
+    scale = {"v2": _SCALE_V2, "v2a": _SCALE_V2A}[variant]
+    return head + scale + "\n" + tail, _USER_V2, 5
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +232,8 @@ def judge(model, variant, texts, seed=0, workers=3):
         rnd.shuffle(idx)
     chunks = [idx[i:i + BATCH] for i in range(0, len(idx), BATCH)]
 
+    raws = []
+
     def one(chunk):
         block = "".join(
             "[%d] %s\n\n" % (j + 1, texts[k].replace("\n", " ")[:TEXT_CHARS])
@@ -210,7 +242,12 @@ def judge(model, variant, texts, seed=0, workers=3):
             try:
                 raw = ask(model, system,
                           tmpl.format(n=len(chunk), articles=block))
-                return parse(raw, len(chunk), variant)
+                out = parse(raw, len(chunk), variant)
+                # Сырой ответ нужен только там, где разбор что-то потерял:
+                # «без решения: 5» без него — число, о котором нечего сказать.
+                if any(v is None for v in out):
+                    raws.append(raw[:1200])
+                return out
             except Exception as exc:  # noqa: BLE001
                 if attempt == 2:
                     print("  батч упал: %s" % exc, file=sys.stderr)
@@ -222,7 +259,7 @@ def judge(model, variant, texts, seed=0, workers=3):
         for chunk, res in zip(chunks, ex.map(one, chunks)):
             for k, v in zip(chunk, res):
                 out[k] = v
-    return out
+    return out, raws
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +318,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=120)
     ap.add_argument("--model", default="qwen3.5:9b")
-    ap.add_argument("--variants", default="v1,v2")
+    ap.add_argument("--variants", default="v1,v2,v2a")
     ap.add_argument("--out", default=os.path.join(BASE, "bench", "judge_runs.json"))
     a = ap.parse_args()
 
@@ -293,15 +330,16 @@ def main():
     for variant in a.variants.split(","):
         k = prompts(variant)[2]
         t0 = time.time()
-        r1 = judge(a.model, variant, texts, seed=0)
-        r2 = judge(a.model, variant, texts, seed=101)
+        r1, raw1 = judge(a.model, variant, texts, seed=0)
+        r2, _raw2 = judge(a.model, variant, texts, seed=101)
         dt = time.time() - t0
         s = stats(r1, k, prod)
         s["self_exact"], s["self_gap"] = self_agree(r1, r2, k)
         s["seconds"] = round(dt)
         s["levels"] = k
         report[variant] = s
-        runs[variant] = [list(v) if v else None for v in r1]
+        runs[variant] = {"verdicts": [list(v) if v else None for v in r1],
+                         "unparsed": raw1}
         print("\n=== %s (делений %d, %ds)" % (variant, k, dt))
         print("  распределение: %s" % s["dist"])
         print("  доля верхнего разряда: %.3f   без решения: %d"
