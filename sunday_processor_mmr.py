@@ -104,7 +104,9 @@ import event_date
 import importance
 import prefilter
 import retell_select
+import ru_guard
 import translit_guard
+import model_rotation
 from model_rotation import _call_openrouter_raw, providers_exhausted
 from word_generator import build_digest
 from telegram_sender import send_document
@@ -579,8 +581,8 @@ def select_representatives(articles: list) -> tuple[list, dict]:
 # Системные промпты
 # ---------------------------------------------------------------------------
 _SYSTEM_PROMPT_RETELL = """\
-Retell the source article in RUSSIAN for an academic digest, in 3–4 sentences \
-forming ONE paragraph.
+Retell the source article in RUSSIAN for an academic digest as ONE compact \
+paragraph of 90–120 words.
 The reader follows science, education and youth policy but knows NOTHING about \
 this particular country's institutions, exams, agencies or political parties. \
 Write so that such a reader understands the news without looking anything up.
@@ -597,6 +599,13 @@ Latin spelling (İŞKUR, TÜBİTAK, Erasmus+). Do not transliterate them.
 inflected for case as Russian grammar requires.
 - When the established Russian form is not obvious, keep the Latin original \
 rather than inventing a transliteration.
+- Cities, universities and geographic features take the form ESTABLISHED in \
+Russian, never a fresh transliteration of the local spelling: Стамбул (not \
+«Истанбул»), Северо-Анатолийский разлом (not «Северо-Анадольский»), Анкара, \
+Тбилиси, Алматы.
+- A university is never replaced by the name of its city. Write «университеты \
+Анкары и Стамбула» or name the university, never «ведущие университеты, \
+включая Анкару и Стамбул» — a city is not a university.
 
 Words that are NOT names:
 - A COMMON noun stays a common noun and gets TRANSLATED. Never spell a foreign \
@@ -631,14 +640,32 @@ never a separate explanatory sentence — the facts of the news must not lose ro
 to them.
 
 Rules:
-- Length: the summary must be 3–4 sentences — concise, only the essential facts. \
-It is ONE continuous paragraph: no line breaks, no bullet points, no numbered list.
+- Length: **90–120 WORDS**. This is a hard budget, not a suggestion — count the \
+words before you answer and cut until you are inside it. For reference, this \
+very rule is about 40 words long. Sentence count does not matter: use three \
+short sentences or five, whichever fits the facts — the reader's effort tracks \
+total length, not the number of full stops.
+- Density over brevity: do NOT drop a fact to save room. Drop WORDS instead — \
+introductory clauses ("следует отметить, что", "в рамках проведённого"), \
+doubled adjectives, and restatements of what the previous sentence already \
+said. Numbers, names, dates, sums and the glosses that make them intelligible \
+to a newcomer stay in every time: they are the reason the entry exists.
+- It is ONE continuous paragraph: no line breaks, no bullet points, no numbered list.
 - Do not leave ANY word, phrase, or clause untranslated in Turkish, English, or any \
 other language — render everything in Russian.
 - Russian grammar, cases, agreement and word order must be correct and natural. \
 Do not calque English syntax: no chains of participles where a Russian writer \
 would use a subordinate clause, no strings of nouns in the genitive.
 - Do not invent facts.
+- The title MUST be a complete sentence WITH A PREDICATE: it has to say what \
+HAPPENED, not merely where. «В Эрзинджане и Бингёльском регионе» names a place \
+and reports nothing; «В Эрзинджане нашли два магматических резервуара» is a \
+title. A title without a verb is rejected and the whole answer is rewritten.
+- "yerli", "milli", "homegrown", "domestic", "indigenous" describing technology \
+mean ОТЕЧЕСТВЕННЫЙ or СОБСТВЕННОЙ РАЗРАБОТКИ — never «домашний», which in \
+Russian means "of the household".
+- Every adjective must agree with its noun in gender, number and case. \
+«программа студенческой амнистии», never «программа студенческого амнистия».
 - Keep ONLY content related to science, education, youth policy in Turkey, Central Asia, South Caucasus, or external engagement involving Central Asia and South Caucasus. \
 If the source article also covers other, unrelated topics or events, SILENTLY DROP \
 them — do not summarize, mention, or even briefly reference the unrelated parts. \
@@ -678,10 +705,165 @@ deadline, not the day something happened. Return null for those.
 - For a multi-day event give its FIRST day.
 
 Return ONLY valid JSON, no markdown fences:
-{"title": "<заголовок по-русски>", "summary": "<пересказ по-русски, 3–4 предложения, один абзац>", "event_date": "YYYY-MM-DD или null"}
+{"title": "<заголовок по-русски>", "summary": "<пересказ по-русски, один абзац, 90–120 слов>", "event_date": "YYYY-MM-DD или null"}
+"""
+
+# Схема ответа пересказа. Уезжает в Ollama как format: по ней строится
+# грамматика, и невалидный JSON становится невозможен, а не «маловероятен».
+# Держать её рядом с промптом обязательно: разъедутся — молча сломается разбор.
+_RETELL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title":      {"type": "string"},
+        "summary":    {"type": "string"},
+        "event_date": {"type": ["string", "null"]},
+    },
+    "required": ["title", "summary", "event_date"],
+}
+
+_POSTPROCESS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "idx":     {"type": "integer"},
+            "title":   {"type": "string"},
+            "summary": {"type": "string"},
+        },
+        "required": ["idx", "title", "summary"],
+    },
+}
+
+_SYSTEM_PROMPT_VERIFY = """You are a fact-checking editor for a Russian-language news digest.
+
+You receive the SOURCE material an assistant was given (one or more news
+articles, in Turkish, English, Russian or another language) and the Russian
+TITLE and SUMMARY it produced from them.
+
+Report ONLY defects of MEANING. Say nothing about style, tone, length,
+punctuation or word choice that does not change what is said.
+
+Report a fragment if and only if it is one of:
+  MISTRANSLATION - it renders a source word so that the meaning changes:
+                   "yerli"/"homegrown" turned into «домашний», which in Russian
+                   means "of the household", not "domestically made".
+  WRONG_ENTITY   - it names the wrong KIND of thing: a city where the source
+                   names a university, a ministry where the source names an
+                   agency, a person where the source names an organisation.
+  GARBLED        - a phrase that is not grammatical Russian and cannot be
+                   understood, e.g. «согласно принятому TBMM» where «принятому»
+                   has no noun to agree with.
+
+Rules that keep this useful:
+- Quote the fragment EXACTLY as it stands in the Russian text, character for
+  character. A quote that is not in the text is thrown away, and your report
+  with it.
+- Shortening, generalising or leaving something out is NOT a defect, and
+  neither is a detail you merely did not find: another editor checks coverage.
+  You judge one thing only - whether what IS written means what the source
+  means.
+- Do not check numbers and dates against the source: another check does that.
+- At most 3 problems, the most serious first.
+- If the text is sound, return an empty list. An empty list is the EXPECTED
+  answer for most items - do not invent a problem to look useful.
+
+Return ONLY valid JSON, no markdown fences:
+{"problems": [{"quote": "<точная цитата>", "kind": "MISTRANSLATION|WRONG_ENTITY|GARBLED", "why": "<одна фраза по-русски>"}]}
 """
 
 _USER_PROMPT_RETELL_TEMPLATE = "Article URL: {url}\nArticle text:\n{text}"
+
+
+# Сколько слов в цитате судьи ещё считается точечной ошибкой перевода, а не
+# спором о полноте пересказа. См. замер в _validate_summary_meaning.
+_MEANING_BLOCK_WORDS = 3
+
+
+def _verify_call(user_msg: str) -> str | None:
+    """Запрос к судье закреплённой моделью, с откатом на общую ротацию.
+
+    Пул ":free" здесь не годится: на одном и том же пересказе три прогона
+    подряд дали три разных вердикта, потому что ротация каждый раз брала
+    другую модель. Судья должен быть один и тот же, иначе его порог нельзя
+    ни измерить, ни настроить.
+    """
+    model = getattr(config, "MEANING_CHECK_MODEL", "")
+    if model and config.GOOGLE_API_KEY:
+        try:
+            return model_rotation._openai_chat(
+                model_rotation.GOOGLE_API_URL, config.GOOGLE_API_KEY, model,
+                _SYSTEM_PROMPT_VERIFY, user_msg, tag="Google")
+        except Exception as exc:
+            log.warning(" смысловая проверка: закреплённая модель %s не ответила (%s), "
+                        "иду в общую ротацию", model, exc)
+    return _call_openrouter_raw(_SYSTEM_PROMPT_VERIFY, user_msg,
+                                ref_url="verify", prefer_local=False)
+
+
+def _validate_summary_meaning(result: dict, source: str) -> tuple[bool, str]:
+    """Смысловая проверка пересказа отдельным вызовом.
+
+    Стражи формы проверяют вид ошибки: смешение алфавитов, обрыв, чужой язык,
+    несогласованную пару. Смысл они не видят по устройству — «Турция планирует
+    запустить лунный корабль с домашней гибридной системой тяги» безупречно
+    по форме и неверно по сути (yerli — отечественный). Такое ловит только
+    тот, кто прочитал и статью, и пересказ.
+
+    Проверяющий идёт в ОБЛАКО (prefer_local=False): пересказ пишет qwen3:8b на
+    домашнем сервере, и судить его работу той же моделью смысла нет. Вызовов
+    немного — один на сюжет, несколько десятков за недельный прогон.
+
+    Проверяющий тоже модель и тоже выдумывает, поэтому претензия принимается
+    только с точной цитатой из проверяемого текста: цитаты нет в тексте —
+    претензии не было. Ошибка разбора ответа трактуется в пользу пересказа:
+    молчащий судья не должен останавливать выпуск.
+    """
+    if not getattr(config, "MEANING_CHECK", True) or not source:
+        return True, "ok"
+
+    full = f"{result.get('title', '')}\n{result.get('summary', '')}"
+    user_msg = ("SOURCE MATERIAL:\n" + source[:config.RETELL_CHARS_TOTAL]
+                + "\n\nRUSSIAN TITLE:\n" + result.get("title", "")
+                + "\n\nRUSSIAN SUMMARY:\n" + result.get("summary", ""))
+
+    raw = _verify_call(user_msg)
+    parsed = _parse_llm_json(raw)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("problems"), list):
+        log.info(" смысловая проверка: ответ не разобран, пересказ принят как есть")
+        return True, "ok"
+
+    real = [p for p in parsed["problems"]
+            if isinstance(p, dict) and isinstance(p.get("quote"), str)
+            and p["quote"].strip() and p["quote"].strip() in full]
+    dropped = len(parsed["problems"]) - len(real)
+    if dropped:
+        log.info(" смысловая проверка: %d претензий без цитаты в тексте отброшено", dropped)
+    if not real:
+        return True, "ok"
+
+    # Замер 14.08.2026 на двух пунктах: судья поймал настоящую ошибку перевода
+    # («домашней» вместо «отечественной») и придрался к исправному пункту —
+    # к придаточному «где обсуждались проекты по климату, ИИ и социальным
+    # инициативам», хотя источник об этом пишет. Разница между уловом и
+    # придиркой оказалась не в классе, а в длине цитаты: ошибка перевода — это
+    # слово, а спор о полноте — это оборот. Поэтому переписывать пересказ
+    # заставляет только короткая цитата; длинную пишем в журнал и пропускаем,
+    # чтобы её можно было прочитать после прогона и решить самому.
+    #
+    # Выборка крошечная, правило держится на ней одной. Если в журнале
+    # накопятся пропущенные настоящие ошибки — порог поднять.
+    short = [p for p in real if len(p["quote"].split()) <= _MEANING_BLOCK_WORDS]
+    for p in real:
+        if p not in short:
+            log.info(" смысловая проверка (к сведению, не блокирует): %s — «%s» — %s",
+                     p.get("kind", "?"), p["quote"].strip(), p.get("why", ""))
+    if not short:
+        return True, "ok"
+
+    worst = short[0]
+    return False, ("смысл (%s): «%s» — %s"
+                   % (worst.get("kind", "?"), worst["quote"].strip(),
+                      worst.get("why", "")))
 
 
 def _retell_sources(versions: list) -> tuple[str, list]:
@@ -784,6 +966,16 @@ _MIN_CYRILLIC = 0.5
 _RU_ALPHABET = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
 _MAX_FOREIGN_CYRILLIC = 0.02
 
+# Потолок длины пересказа В ЗНАКАХ. Промпт просит 380–550; здесь порог выше
+# просимого намеренно — отбраковка за 560 знаков стоила бы ретрая на ровном
+# месте, а вот вдвое переросший абзац ломает вёрстку .docx и его действительно
+# надо переписать.
+#
+# Нижней границы нет намеренно: вырожденно короткий ответ уже ловят проверки
+# на заголовок-обрубок и на обрыв текста, а лишний порог только отбраковывал
+# бы законно короткий пересказ там, где в новости и правда два факта.
+_MAX_SUMMARY_CHARS = 1400
+
 # Третий алфавит. Модель иногда вставляет кусок исходного письма прямо в
 # русское слово: «Обучающий этап نظمил Министерство энергетики» (замер
 # 07.08.2026), а 25.07.2026 читателю ушёл пункт с «фонду
@@ -858,9 +1050,19 @@ def _validate_summary_fast(result: dict, source: str = "") -> tuple[bool, str]:
     if len(title_words) < 3:
         return False, f"заголовок-обрубок: «{title}»"
 
-    m = _MIXED_SCRIPT_RE.search(full)
-    if m:
-        return False, f"смешение скриптов внутри слова: «{m.group()}»"
+    # Заголовок без сказуемого сообщает место, но не событие: «В Эрзинджане и
+    # Бингёльском регионе» дошло до читателя 14.08.2026. Счёт значимых слов
+    # такое пропускает — нужен разбор.
+    if ru_guard.title_without_predicate(title):
+        return False, f"заголовок без сказуемого, событие не названо: «{title}»"
+
+    mixed = ru_guard.mixed_script(full)
+    if mixed:
+        return False, f"смешение скриптов внутри слова: «{mixed}»"
+
+    study = ru_guard.study_without_object(full)
+    if study:
+        return False, f"«изучение» без объекта: «{study}» (нужно обучение/учёба)"
 
     third = _third_script_letters(full)
     if third:
@@ -887,15 +1089,45 @@ def _validate_summary_fast(result: dict, source: str = "") -> tuple[bool, str]:
     # контэнджан стипендиальной программы» (09.08.2026), «пуаны» вместо баллов.
     # Промпт это запрещает, но запрет промпта модель соблюдает вероятностно —
     # см. translit_guard.
-    copied = translit_guard.copied_words(full, source)
+    copied = translit_guard.copied_words(full, source) if source else []
     if copied:
         w, src = copied[0]
         return False, (f"слово источника кириллицей вместо перевода: "
                        f"«{w}» ← {src}")
 
-    quote = _quote_not_in_source(full, source)
+    # Несогласованная пара «прилагательное + существительное»: «правила
+    # программы студенческого амнистия» (14.08.2026). Правило узкое, замер и
+    # отсечки — в шапке ru_guard.
+    disagreement = ru_guard.bad_agreement(full)
+    if disagreement:
+        return False, f"нарушено согласование: «{disagreement[0]}»"
+
+    # Латинская аббревиатура источника, переписанная кириллицей: «Совет по
+    # высшему образованию (ЮК)» вместо YÖK (14.08.2026). Алфавит один, JSON
+    # валиден, кириллицы достаточно — ни один прежний страж это не видел.
+    abbrs = ru_guard.transliterated_abbreviations(full, source)
+    if abbrs:
+        word, origin = abbrs[0]
+        return False, (f"аббревиатура источника переписана кириллицей: "
+                       f"«{word}» ← {origin}")
+
+    # Крупное число, которого в прочитанном моделью тексте нет.
+    invented = ru_guard.numbers_not_in_source(full, source)
+    if invented:
+        return False, f"число не из источника: «{invented[0]}»"
+
+    quote = _quote_not_in_source(full, source) if source else None
     if quote:
         return False, f"надпись не из источника: «{quote}»"
+
+    # Длина считается в ЗНАКАХ, а не в предложениях: читателя утомляет объём,
+    # а не количество точек, и три тяжёлых предложения читаются хуже пяти
+    # коротких. Промпт просит 90–120 слов (≈630–900 знаков), здесь потолок с запасом —
+    # отбраковывать за 560 знаков значило бы жечь ретрай на пустяке, а вот
+    # вдвое переросший абзац ломает вёрстку дайджеста и его стоит переписать.
+    n = len(summary.strip())
+    if n > _MAX_SUMMARY_CHARS:
+        return False, f"пересказ слишком длинный: {n} знаков (потолок {_MAX_SUMMARY_CHARS})"
 
     return True, "ok"
 
@@ -917,7 +1149,12 @@ def _retell_article(url: str, versions: list, pub_date: str, attempt_label: str)
     hint = ""
     for attempt in range(1, MAX_RETRIES + 1):
         log.info(" %s попытка %d/%d: %s", attempt_label, attempt, MAX_RETRIES, url)
-        raw    = _call_openrouter_raw(_SYSTEM_PROMPT_RETELL, user_msg + hint, ref_url=url)
+        # Пересказ идёт на свою модель: её текст попадает прямо в .docx, и
+        # стабильное качество прогон за прогоном тут важнее, чем лотерея
+        # ":free"-пула. Облако остаётся страховкой, если сервер недоступен.
+        raw    = _call_openrouter_raw(_SYSTEM_PROMPT_RETELL, user_msg + hint,
+                                      ref_url=url, prefer_local=True,
+                                      schema=_RETELL_SCHEMA)
         result = _parse_llm_json(raw)
 
         if result is None:
@@ -925,6 +1162,8 @@ def _retell_article(url: str, versions: list, pub_date: str, attempt_label: str)
             continue
 
         ok, reason = _validate_summary_fast(result, user_msg)
+        if ok:
+            ok, reason = _validate_summary_meaning(result, user_msg)
         if not ok:
             log.warning(" %s попытка %d: %s", attempt_label, attempt, reason)
             # Повторять тот же промпт — значит надеяться, что модель передумает
@@ -961,12 +1200,42 @@ def _retell_article(url: str, versions: list, pub_date: str, attempt_label: str)
 # ---------------------------------------------------------------------------
 MAX_RESERVE_SCAN = 50
 
+# Порог дедупа для ПЕРЕСКАЗОВ (не для статей-источников).
+#
+# Зачем отдельная проверка. Дедуп слота шёл по эмбеддингу СТАТЬИ, а дубликат
+# видит читатель — в пересказе. Три разных турецких статьи (закон об амнистии,
+# правила YÖK, начало приёма заявлений) как тексты различаются и порог 0.90 по
+# источнику не берут, а сжатые в абзац по 90-120 слов становятся почти
+# одинаковыми: 0.93-0.95. 16.08.2026 в дайджест ушли три таких пункта подряд.
+#
+# Порог выбран замером по всем 34 отгруженным дайджестам (5822 пары пунктов):
+# медиана 0.798, 99-й процентиль 0.881, 99.5-й — 0.893. То есть 0.90 это уже
+# явный хвост, а не «похожая тема»: выше него оказалось 24 пары из 5822 (0.4%,
+# примерно по одной на выпуск), и все они при просмотре — настоящие дубликаты
+# (квоты в Грузии, книга Си Цзиньпина, ИИ-фабрика в Армении, амнистия).
+# Поднимать выше нельзя: на 0.95 из тех же 24 остаются 4.
+SUMMARY_DUP_COSINE = float(os.environ.get("SUMMARY_DUP_COSINE", "0.90"))
+
+
+def _summary_embedding(result: dict) -> np.ndarray:
+    """Эмбеддинг готового пункта дайджеста — заголовок плюс пересказ.
+
+    Префикс "passage: " тот же, что у daily_collector.embed_texts: e5 без
+    префикса живёт в другом углу пространства, и мешать две системы координат
+    в одном сравнении нельзя."""
+    import embedder
+    text = "passage: %s. %s" % (result.get("title", ""), result.get("summary", ""))
+    vec = embedder.get_engine().encode([text], convert_to_numpy=True)
+    return np.asarray(vec, dtype=np.float32).reshape(-1)
+
+
 def _process_slot(
     primary: tuple,
     regional_reserves: dict,
     processed_urls: set,
     accepted_embeddings: list[np.ndarray],
     slot_label: str,
+    accepted_summary_embs: list[np.ndarray] | None = None,
 ) -> dict | None:
     scanned = 0
     primary_bucket = primary[4]
@@ -1030,6 +1299,28 @@ def _process_slot(
             )
             continue
 
+        # Второй дедуп — уже по ГОТОВОМУ пересказу. Первый (выше) смотрит на
+        # статью-источник и ловит перепечатки; этот ловит разные статьи об
+        # одном событии, которые становятся неотличимы только после сжатия в
+        # абзац. Проверять раньше нечего: пересказа ещё не существует.
+        if accepted_summary_embs is not None:
+            s_emb = _summary_embedding(result)
+            s_dup, s_sim = _is_semantic_duplicate(
+                emb=s_emb,
+                selected_embs=accepted_summary_embs,
+                threshold=SUMMARY_DUP_COSINE,
+            )
+            log.info(" %s: dup-check пересказа max_sim=%.4f threshold=%.2f",
+                     slot_label, s_sim, SUMMARY_DUP_COSINE)
+            if s_dup:
+                log.warning(
+                    " %s: пересказ дублирует уже принятый пункт (max_sim=%.4f) — "
+                    "берём следующую из корзины %s",
+                    slot_label, s_sim, primary_bucket,
+                )
+                continue
+            result["summary_embedding"] = s_emb
+
         result["embedding"] = emb
         log.info(" %s: принята статья %s", slot_label, url)
         return result
@@ -1049,9 +1340,17 @@ You will receive a JSON array of digest items. Each item has:
 
 Keep every item in Russian. Do not translate, rewrite or "improve" the wording.
 
-Apply ONE check and return a corrected JSON array:
+Apply TWO checks and return a corrected JSON array:
 
-1. DUPLICATE EVENTS
+1. MIXED SCRIPTS
+   A word must not mix Cyrillic and Latin letters: «ОДTÜ» is «ОД» in Cyrillic
+   with «TÜ» in Latin. Rewrite such a word entirely in ONE alphabet — the Latin
+   original for a name or an abbreviation (ODTÜ, YÖK, TÜBİTAK), Russian for a
+   common noun. A hyphenated compound is not a violation: «AI-платформа» and
+   «ИИ-хаб» are correct as they are.
+   Change NOTHING else in the item while doing it.
+
+2. DUPLICATE EVENTS
    If two or more items describe the same real-world event (same fact, same
    figures, same actors — even if worded differently), keep only the item
    with the higher idx value and remove the others.
@@ -1083,7 +1382,11 @@ def _postprocess_digest(summaries: list[dict]) -> list[dict]:
         + json.dumps(items_for_llm, ensure_ascii=False, indent=2)
     )
 
-    raw = _call_openrouter_raw(_SYSTEM_PROMPT_POSTPROCESS, user_msg, ref_url="postprocess")
+    # Постобработка правит уже готовые тексты дайджеста — та же логика, что и
+    # у пересказа: своя модель первой, облако страховкой.
+    raw = _call_openrouter_raw(_SYSTEM_PROMPT_POSTPROCESS, user_msg,
+                               ref_url="postprocess", prefer_local=True,
+                               schema=_POSTPROCESS_SCHEMA)
     if raw is None:
         log.warning("Пост-обработка: LLM вернул None — оставляем дайджест без изменений")
         return summaries
@@ -1115,6 +1418,18 @@ def _postprocess_digest(summaries: list[dict]) -> list[dict]:
         merged = {**original}
         merged["title"]   = corrected.get("title",   original["title"])
         merged["summary"] = corrected.get("summary", original["summary"])
+        # Текст после редактора уезжал в .docx мимо всех стражей: они стоят
+        # только на пересказе. Именно так «ОДTÜ» и доехало до читателя
+        # 14.08.2026 — правку никто не перечитывал. Исходной статьи здесь нет,
+        # поэтому проверки по источнику пропускаются, остальные работают.
+        if (merged["title"] != original["title"]
+                or merged["summary"] != original["summary"]):
+            ok, reason = _validate_summary_fast(merged)
+            if not ok:
+                log.warning("Пост-обработка: правка idx=%d забракована (%s) — "
+                            "оставляю исходный текст", i, reason)
+                merged["title"]   = original["title"]
+                merged["summary"] = original["summary"]
         result.append(merged)
 
     if removed:
@@ -1173,6 +1488,7 @@ def main():
         summaries: list[dict] = []
         processed_urls: set[str] = set()
         accepted_embeddings: list[np.ndarray] = []
+        accepted_summary_embs: list[np.ndarray] = []
         target = config.N_CLUSTERS
 
         for rep in reps:
@@ -1189,10 +1505,13 @@ def main():
                 processed_urls=processed_urls,
                 accepted_embeddings=accepted_embeddings,
                 slot_label=slot_label,
+                accepted_summary_embs=accepted_summary_embs,
             )
 
             if result is not None:
                 accepted_embeddings.append(result["embedding"])
+                if "summary_embedding" in result:
+                    accepted_summary_embs.append(result.pop("summary_embedding"))
                 summaries.append(result)
             else:
                 log.warning("Слот %d не заполнен.", len(summaries) + 1)

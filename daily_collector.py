@@ -459,6 +459,15 @@ def fetch_and_extract(url):
     except Exception as exc:
         log.warning("Failed to download %s: %s", url, exc)
         return None, None, None
+    # requests при отсутствии charset в заголовке Content-Type берёт
+    # ISO-8859-1 (так предписывает RFC 2616), хотя страница объявляет UTF-8
+    # в мета-теге. Турецкие сайты заголовок часто не ставят, и текст приезжал
+    # искажённым: «BAÅVURU» вместо «BAŞVURU», «GEÃMÄ°Å» вместо «GEÇMİŞ».
+    # Замер 14.08.2026: 34 статьи из 1496, из них 30 турецких, три домена —
+    # bursahakimiyet.com.tr, hurhaber.com, turktime.com. Модель читала этот
+    # текст и по нему писала пересказ.
+    if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "latin-1", "latin1"):
+        resp.encoding = resp.apparent_encoding or "utf-8"
     return extract_page(resp.text, url)
 
 

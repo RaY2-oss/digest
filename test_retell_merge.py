@@ -171,7 +171,7 @@ def test_event_date_wins_only_when_it_checks_out():
 
     real = spm._call_openrouter_raw
     try:
-        spm._call_openrouter_raw = lambda s, u, ref_url=None: (
+        spm._call_openrouter_raw = lambda s, u, ref_url=None, **kw: (
             '{"title": "В Турции прошла конференция по науке", '
             '"summary": "В Анкаре прошла научная конференция исследователей.", '
             '"event_date": "%s"}' % ev)
@@ -180,7 +180,7 @@ def test_event_date_wins_only_when_it_checks_out():
         assert got and got["publish_date"] == ev, got
 
         # Та же дата, но в тексте её нет — печатается публикация.
-        spm._call_openrouter_raw = lambda s, u, ref_url=None: (
+        spm._call_openrouter_raw = lambda s, u, ref_url=None, **kw: (
             '{"title": "В Турции прошла конференция по науке", '
             '"summary": "В Анкаре прошла научная конференция исследователей.", '
             '"event_date": "%s"}'

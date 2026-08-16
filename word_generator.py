@@ -110,11 +110,20 @@ def build_digest(summaries):
             p_url = doc.add_paragraph()
             r_url = p_url.add_run("URL: " + "; ".join(live))
             r_url.italic = True
-            r_url.font.size = Pt(10)
+            r_url.font.size = Pt(8)
 
         doc.add_paragraph()
 
-    out_name = f"digest_{time.strftime('%Y-%m-%d')}.docx"
-    out_path = os.path.join(config.OUTPUT_DIR, out_name)
+    base = f"digest_{time.strftime('%Y-%m-%d')}"
+    out_path = os.path.join(config.OUTPUT_DIR, base + ".docx")
+    # Имя зависело только от даты, поэтому второй прогон в тот же день молча
+    # затирал первый — а несколько прогонов на одну дату здесь обычное дело,
+    # ради них в документе и стоит московское время. Так 14.08.2026 пропал
+    # готовый выпуск: его перезаписал тестовый документ. Лишний файл на диске
+    # стоит дешевле потерянного выпуска.
+    n = 2
+    while os.path.exists(out_path):
+        out_path = os.path.join(config.OUTPUT_DIR, f"{base}-{n}.docx")
+        n += 1
     doc.save(out_path)
     return out_path

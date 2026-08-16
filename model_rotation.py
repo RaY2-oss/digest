@@ -23,6 +23,7 @@ import time
 import requests
 
 import config
+import quota
 
 log = logging.getLogger("model_rotation")
 
@@ -85,6 +86,43 @@ GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 # не содержат платных моделей для такого ключа, поэтому фильтровать "бесплатные"
 # нечего — в отличие от OpenRouter, где это делает суффикс ":free".
 FALLBACK_POOL_SIZE = 5
+
+# Последний рубеж: своя модель на домашнем сервере (Ollama, OpenAI-совместимый
+# /v1/chat/completions по VPN). В кольцо round-robin НЕ входит намеренно —
+# она слабее любой облачной, и отдавать ей вызовы, пока у облака остались
+# суточные лимиты, значит терять качество дайджеста на ровном месте.
+# Включается только когда quota.all_cloud_exhausted() говорит, что выбраны все
+# три. Пустой LOCAL_LLM_URL полностью выключает эту ветку.
+LOCAL_LLM_URL = os.environ.get("LOCAL_LLM_URL", "")
+LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "qwen3:14b-q5_K_M")
+# Локальная 14B на 16 ГБ отвечает заметно медленнее облачной: таймаут щедрее.
+LOCAL_TIMEOUT = int(os.environ.get("LOCAL_LLM_TIMEOUT", "300"))
+
+# Окно контекста локальной модели.
+#
+# Ollama поднимает модель со своим умолчанием в 4096 токенов, и это не «мало»,
+# а тихо ломающе. Промпт пересказа — системный (~2.1 тыс. токенов) плюс до
+# шести версий сюжета — весит 4-6 тыс. Переполнение Ollama не отвергает и
+# ничем не сообщает: она срезает промпт примерно ВДВОЕ И ОТ НАЧАЛА. Начало —
+# это весь системный промпт: требование отвечать JSON'ом, требование писать
+# по-русски, правила написания имён. Модель оставалась с одними текстами
+# статей и добросовестно пересказывала их маркдауном на языке источника.
+#
+# Замер 15.08.2026: 61% ответов «JSON не распарсился», 234 обращения к модели
+# ради 20 пунктов, 88% времени прогона впустую, полтора-два часа на дайджест.
+#
+# 16384 покрывает и пересказ, и постобработку — та шлёт весь дайджест одним
+# куском и столько же генерирует обратно. На карте это 5.8 ГБ: влезает целиком,
+# проверено 16.08.2026. Растить дальше без нужды не стоит — это VRAM на общей
+# карте, где ещё считают sciwriter и quantlab.
+LOCAL_NUM_CTX = int(os.environ.get("LOCAL_LLM_NUM_CTX", "16384"))
+
+# qwen3 — гибридная reasoning-модель: без явного выключения она тратит на
+# <think> больше токенов, чем на сам ответ. Замер 16.08.2026 на 12 реальных
+# сюжетах: выключение ускорило пересказ с 32.7 до 14.9 с при том же числе
+# годных ответов (7 из 12). Включать обратно есть смысл, только если появится
+# модель, которой размышление реально помогает — тогда LOCAL_LLM_THINK=1.
+LOCAL_THINK = os.environ.get("LOCAL_LLM_THINK", "0") not in ("0", "", "false", "no")
 
 # Чёрный список заведомо слабых моделей: если id содержит один из этих
 # (регистронезависимых) фрагментов — в пул не берём. Слабая модель = плохая
@@ -258,6 +296,9 @@ def _openrouter_attempt(system_prompt: str, user_message: str, ref_url: str = ""
         }
 
         need_pause = False
+        # Считаем ДО отправки: у OpenRouter неудачные попытки тоже съедают
+        # суточную квоту ":free", так что списывать только успехи нельзя.
+        quota.note_request("OpenRouter")
         try:
             resp = requests.post(
                 OPENROUTER_API_URL,
@@ -271,6 +312,8 @@ def _openrouter_attempt(system_prompt: str, user_message: str, ref_url: str = ""
             # Сетевая ошибка — сразу следующая модель, без паузы.
             _demote(model_id)
             continue
+
+        quota.note_response("OpenRouter", resp)
 
         if resp.status_code == 200:
             try:
@@ -357,16 +400,50 @@ def providers_exhausted() -> bool:
     проверяет это, чтобы не сжигать резерв корзины на заведомо провальных вызовах.
     Кулдаун провайдеров тут больше не смотрим: его нет, а бюджет тратится только
     на кругах, где не ответил никто."""
-    if not _ring_tags():
-        return True
-    return _wait_spent >= RING_WAIT_BUDGET
+    tags = _ring_tags()
+    if not tags:
+        # Ключей нет вовсе — но локальная модель ключа и не требует.
+        return not LOCAL_LLM_URL
+    if _wait_spent >= RING_WAIT_BUDGET:
+        # Бюджет ожидания сожжён. Сама по себе настроенная локальная модель это
+        # не отменяет: путь к ней открывается ТОЛЬКО через all_cloud_exhausted,
+        # то есть когда выбраны суточные лимиты. Круги, проваленные по другой
+        # причине (упавшие модели, сеть), к ней не ведут — и тогда для
+        # вызывающего кода это действительно "всё".
+        return not (LOCAL_LLM_URL and quota.all_cloud_exhausted(tags))
+    return False
 
 
-def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "") -> str | None:
+def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "",
+                         prefer_local: bool = False,
+                         schema: dict | None = None) -> str | None:
+    """prefer_local=True — сначала своя модель, облако только если она не ответила.
+
+    Две разные политики для двух разных задач, и разница тут не в экономии:
+
+      Классификация (daily_collector) — тысячи коротких вызовов за прогон.
+      Ошибка в одном стоит одной статьи, зато объём такой, что локальная карта
+      стала бы узким местом. Идём в облако, локальная — аварийный резерв.
+
+      Пересказ и постобработка дайджеста (sunday_processor_mmr) — десятки
+      вызовов раз в неделю, и каждый попадает в итоговый .docx, который читает
+      человек. Здесь важнее предсказуемость: своя модель не кончается по
+      лимиту посреди сборки и даёт стабильное качество прогон за прогоном,
+      тогда как облачный пул каждый раз подсовывает другую ":free"-модель.
+    """
     global _rr_start, _wait_spent
+
+    if prefer_local and LOCAL_LLM_URL:
+        out = _local_attempt(system_prompt, user_message, ref_url, schema)
+        if out is not None:
+            return out
+        log.warning("Локальная модель не ответила — уходим в облако (%s)", ref_url)
 
     tags = _ring_tags()
     if not tags:
+        if LOCAL_LLM_URL and not prefer_local:
+            # Ключей нет вовсе, но своя модель настроена — она и отработает.
+            return _local_attempt(system_prompt, user_message, ref_url, schema)
         log.error("_call_openrouter_raw: не задан ни один ключ провайдера")
         return None
 
@@ -380,12 +457,25 @@ def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "
             if out is not None:
                 _rr_start = (_rr_start + i + 1) % n  # следующий вызов — со следующего провайдера
                 _mark_alive(tag)
+                quota.note_success(tag)
                 log.info("%s отдал ответ для %s", tag, ref_url)
                 return out
             _mark_dead(tag)  # весь пул провайдера провалился
 
-        # Круг пройден без ответа. Провайдеры остаются в ротации — ждём либо до
-        # ближайшего Retry-After, либо RING_RETRY_PAUSE, и идём на следующий круг.
+        # Круг пройден без ответа. Прежде чем ждать — проверяем, не выбраны ли
+        # СУТОЧНЫЕ лимиты у всех трёх сразу. Если да, ждать бессмысленно (они до
+        # полуночи UTC), и вызов уходит на локальную модель. Частотный 429 сюда
+        # не приводит: quota различает их по длине Retry-After, и на короткой
+        # отсидке мы по-прежнему ждём облако — оно даёт лучшее качество.
+        if quota.all_cloud_exhausted(tags):
+            log.warning("Все облачные исчерпаны (%s) — пробуем локальную модель",
+                        quota.snapshot(tags))
+            out = _local_attempt(system_prompt, user_message, ref_url, schema)
+            if out is not None:
+                return out
+
+        # Провайдеры остаются в ротации — ждём либо до ближайшего Retry-After,
+        # либо RING_RETRY_PAUSE, и идём на следующий круг.
         soonest = min(_provider_dead_until.get(t, 0) for t in tags)
         wait = min(max(soonest - time.time(), RING_RETRY_PAUSE),
                    RING_MAX_WAIT, RING_WAIT_BUDGET - _wait_spent)
@@ -413,9 +503,80 @@ def _provider_call(tag: str, system_prompt: str, user_message: str, ref_url: str
     return None
 
 
+def _local_native_url() -> str:
+    """LOCAL_LLM_URL исторически указывает на OpenAI-совместимый
+    /v1/chat/completions. Родной эндпоинт Ollama лежит на том же хосте.
+
+    Ходим именно в родной, потому что через /v1 НЕ проходят три параметра, и
+    каждый из них здесь обязателен: options.num_ctx (иначе окно 4096 и молчаливая
+    обрезка промпта), format (JSON-схема) и think. Это не прихоть Ollama, а
+    известное ограничение её OpenAI-совместимого слоя."""
+    base = LOCAL_LLM_URL.split("/v1/")[0].rstrip("/")
+    return base + "/api/chat"
+
+
+def _local_attempt(system_prompt: str, user_message: str, ref_url: str = "",
+                   schema: dict | None = None) -> str | None:
+    """Своя модель на домашнем сервере.
+
+    Ключа не требует (сервер доступен только по VPN), таймаут щедрее облачного:
+    8B на одной карте отвечает медленнее, но альтернатива здесь не "быстрее", а
+    "никак".
+
+    schema — JSON-схема ожидаемого ответа. Ollama строит по ней грамматику и
+    физически не может выдать невалидный JSON. Это принципиально надёжнее
+    просьбы «верни только JSON» в промпте: просьбу модель забывает ровно тогда,
+    когда промпт длинный, то есть в самых важных сюжетах."""
+    if not LOCAL_LLM_URL:
+        log.warning("LOCAL_LLM_URL не задан — локального резерва нет")
+        return None
+    payload = {
+        "model": LOCAL_LLM_MODEL,
+        "stream": False,
+        "think": LOCAL_THINK,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_message},
+        ],
+        "options": {"temperature": 0.1, "num_ctx": LOCAL_NUM_CTX},
+    }
+    if schema:
+        payload["format"] = schema
+    try:
+        resp = requests.post(
+            _local_native_url(),
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            # Домашний сервер в VPN: прокси тут не нужен и только мешал бы.
+            proxies=None,
+            timeout=LOCAL_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            log.warning("Локальная модель: HTTP %d", resp.status_code)
+            return None
+        data = resp.json()
+        used = data.get("prompt_eval_count", 0) or 0
+        made = data.get("eval_count", 0) or 0
+        # Тихая обрезка промпта — та самая ошибка, ради которой всё и правилось.
+        # Молчать о ней второй раз нельзя: она не падает, а портит текст.
+        if used + made >= LOCAL_NUM_CTX:
+            log.warning("Локальная модель: промпт %d + ответ %d упёрлись в окно %d "
+                        "для %s — Ollama срежет контекст молча, поднимите "
+                        "LOCAL_LLM_NUM_CTX", used, made, LOCAL_NUM_CTX, ref_url)
+        content = data["message"]["content"]
+        log.info("Локальная модель отдала ответ для %s (промпт %d, ответ %d)",
+                 ref_url, used, made)
+        return _strip_think(content)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Локальная модель недоступна (%s)", exc)
+        return None
+
+
 def _openai_chat(url: str, api_key: str, model_id: str,
                  system_prompt: str, user_message: str, tag: str = "") -> str:
     """Один OpenAI-совместимый chat/completions запрос. Бросает при не-200."""
+    if tag:
+        quota.note_request(tag)
     resp = requests.post(
         url,
         json={
@@ -433,6 +594,10 @@ def _openai_chat(url: str, api_key: str, model_id: str,
         proxies=config.PROXIES,
         timeout=CLASSIFY_TIMEOUT,
     )
+    if tag:
+        # Groq кладёт остаток лимита в заголовки КАЖДОГО ответа — единственный
+        # провайдер, дающий честную цифру без ожидания отказа.
+        quota.note_response(tag, resp)
     if resp.status_code != 200:
         if tag:
             _note_retry_after(tag, resp)
