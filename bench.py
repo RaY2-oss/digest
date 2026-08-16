@@ -42,12 +42,13 @@ cleanup_old_articles.py удаляет статьи старше семи дне
     repeat_share      — доля пунктов выпуска, повторяющих пункт прежнего
                         выпуска (косинус ≥ REPEAT_COS, тот же порог, которым
                         внутри выпуска ловятся дубликаты);
-    mmr_overlap       — совпадение выбора MMR с чистым ранжированием;
     ndcg@7            — только при наличии bench/labels.tsv.
 
 Запуск:
     python bench.py build      # заморозить набор (перезаписывает bench/)
     python bench.py run        # посчитать метрики, обновить bench/BASELINE.md
+    python bench.py sweep      # что даёт вес фактора и кого он заменяет
+    python bench.py quotas     # жёсткая квота против мягкой, на одной шкале
     python bench.py labels     # выписать 200 статей на разметку владельцу
     python bench.py selfcheck
 """
@@ -252,7 +253,7 @@ def _stale(stories, issues):
     return float((S @ A.T).max(axis=1).mean())
 
 
-def measure(basket, issues, quota=None, lam=None, labels=None, weights=None):
+def measure(basket, issues, quota=None, labels=None, weights=None):
     """Все метрики стенда одним проходом. Возвращает плоский dict.
 
     weights — временная подмена config.IMPORTANCE_W_*, чтобы гонять варианты
@@ -271,17 +272,16 @@ def measure(basket, issues, quota=None, lam=None, labels=None, weights=None):
         saved[name] = getattr(config, name)
         setattr(config, name, v)
     try:
-        return _measure(basket, issues, quota, lam, labels)
+        return _measure(basket, issues, quota, labels)
     finally:
         for name, v in saved.items():
             setattr(config, name, v)
 
 
-def _measure(basket, issues, quota, lam, labels):
+def _measure(basket, issues, quota, labels):
     import sunday_processor_mmr as P
 
     quota = dict(P.QUOTA if quota is None else quota)
-    lam = P.MMR_LAMBDA if lam is None else lam
     arts = _articles(basket)
     labels = _read_labels() if labels is None else labels
 
@@ -300,7 +300,6 @@ def _measure(basket, issues, quota, lam, labels):
         imp = P._importance(stories, E)
         order = np.argsort(-imp)
         pure = [stories[i] for i in order[:q]]
-        mmr = P._mmr_pick(stories, q, lam=lam)
 
         # Разрешение на срезе: чем меньше отрыв последнего взятого от первого
         # отброшенного, тем произвольнее граница. Порога тут нет намеренно —
@@ -318,7 +317,6 @@ def _measure(basket, issues, quota, lam, labels):
             "top_scale_stories": (sum(1 for s in raw_scale if s == top_sc)
                                   if top_sc is not None else 0),
             "stale": _stale(pure, issues),
-            "mmr_overlap": len({a[0] for a in pure} & {a[0] for a in mmr}),
             "picked": [a[0] for a in pure],
         }
         if labels:
@@ -369,15 +367,14 @@ def _fmt(res):
              % (res["repeat_share"], res["repeat_compared"]))
     L.append("")
     L.append("| корзина | статей | сюжетов | квота | важность | отрыв на срезе |"
-             " сюжетов с верхним масштабом | близость к прежним | MMR∩важность |"
+             " сюжетов с верхним масштабом | близость к прежним |"
              " nDCG@7 |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|")
+    L.append("|---|---|---|---|---|---|---|---|---|")
     for k, b in res["buckets"].items():
-        L.append("| %s | %d | %d | %d | %.4f | %.4f | %d | %.3f | %d/%d | %s |"
+        L.append("| %s | %d | %d | %d | %.4f | %.4f | %d | %.3f | %s |"
                  % (k, b["n_articles"], b["n_stories"], b["quota"],
                     b["mean_importance"], b["gap_at_cut"],
                     b["top_scale_stories"], b["stale"],
-                    b["mmr_overlap"], b["quota"],
                     ("%.3f" % b["ndcg@7"]) if "ndcg@7" in b else "—"))
     if res["repeat_examples"]:
         L.append("")
@@ -455,7 +452,93 @@ def sweep(factor="NOVELTY", grid=(0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40)):
 
 
 # ---------------------------------------------------------------------------
-# 4. Задание на ручную разметку
+# 4. Квоты
+# ---------------------------------------------------------------------------
+def _global_stories(basket, issues):
+    """Все сюжеты недели и ОДНА важность на всех, а не по корзине на каждую.
+
+    Иначе числа несравнимы между корзинами, и это не мелочь: topic считается
+    через pct_rank, coverage нормируется по максимуму охвата В КОРЗИНЕ. У TR
+    максимум 31 издание, у CA — 3, и одна и та же пара изданий даёт там 0.2, а
+    здесь 1.0. Сравнивать «важность 0.93 в TR» с «0.72 в CA» нельзя вообще:
+    это две разные шкалы, а не два значения одной.
+    """
+    import sunday_processor_mmr as P
+    P._ARCHIVE = _archive_emb(issues)
+    arts = _articles(basket)
+    stories = P._group_stories(arts)
+    E = np.vstack([a[2] for a in stories]).astype(np.float32)
+    return stories, P._importance(stories, E)
+
+
+def _bucket_of(story, quota):
+    return story[4] if story[4] in quota else "MIX"
+
+
+def quotas():
+    """Жёсткая квота против мягкой, на ОДНОЙ шкале важности."""
+    import sunday_processor_mmr as P
+    basket, issues = load()
+    stories, imp = _global_stories(basket, issues)
+    quota = dict(P.QUOTA)
+    total = sum(quota.values())
+    order = list(np.argsort(-imp))
+    titles = dict(zip((str(u) for u in basket["url"]),
+                      (str(t) for t in basket["title"])))
+
+    def report(name, chosen):
+        cnt = {b: 0 for b in quota}
+        for i in chosen:
+            cnt[_bucket_of(stories[i], quota)] += 1
+        print("%-22s важность %.4f  состав %s  худший %.4f"
+              % (name, float(imp[chosen].mean() if len(chosen) else 0),
+                 " ".join("%s=%d" % (b, cnt[b]) for b in quota),
+                 float(imp[chosen].min()) if len(chosen) else float("nan")))
+        return set(chosen)
+
+    hard = []
+    for b, q in quota.items():
+        hard += [i for i in order if _bucket_of(stories[i], quota) == b][:q]
+    hard = np.array(hard)
+    free = np.array(order[:total])
+    print("Одна шкала на всю неделю (%d сюжетов):" % len(stories))
+    s_hard = report("жёсткая 7/7/6", hard)
+    s_free = report("без квот вовсе", free)
+
+    soft_bounds = {"TR": (4, 10), "CA": (3, 9), "SC": (3, 8)}
+    for thr in (None, 0.50, 0.60, 0.70):
+        cnt = {b: 0 for b in quota}
+        chosen = []
+        for b, (lo, _hi) in soft_bounds.items():          # пол каждой корзине
+            for i in [i for i in order if _bucket_of(stories[i], quota) == b][:lo]:
+                chosen.append(i)
+                cnt[b] += 1
+        for i in order:                                   # остаток по важности
+            if len(chosen) >= total:
+                break
+            b = _bucket_of(stories[i], quota)
+            if i in chosen or b not in soft_bounds:
+                continue
+            if cnt[b] >= soft_bounds[b][1]:
+                continue
+            if thr is not None and imp[i] < thr:
+                continue
+            chosen.append(i)
+            cnt[b] += 1
+        s_soft = report("мягкая, порог %s" % ("нет" if thr is None else "%.2f" % thr),
+                        np.array(chosen))
+        if thr is None:
+            for i in sorted(s_soft - s_hard, key=lambda k: -imp[k]):
+                print("   + %s %.4f %.66s" % (_bucket_of(stories[i], quota),
+                                              imp[i], titles.get(stories[i][0], "")))
+            for i in sorted(s_hard - s_soft, key=lambda k: -imp[k]):
+                print("   - %s %.4f %.66s" % (_bucket_of(stories[i], quota),
+                                              imp[i], titles.get(stories[i][0], "")))
+    print("\nсовпадение с жёсткой: без квот %d/%d" % (len(s_free & s_hard), total))
+
+
+# ---------------------------------------------------------------------------
+# 5. Задание на ручную разметку
 # ---------------------------------------------------------------------------
 def labels_task(n=200):
     """200 статей владельцу на разметку — не случайных, а трудных.
@@ -528,4 +611,5 @@ def _selfcheck():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     {"build": build, "run": run, "labels": labels_task, "sweep": sweep,
+     "quotas": quotas,
      "selfcheck": _selfcheck}[cmd]()

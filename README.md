@@ -2,7 +2,8 @@
 
 Daily/weekly news digest bot: collects articles from GDELT GKG, filters them
 by topic+country relevance, scores and summarizes them with an LLM, picks a
-diverse set with MMR, and delivers the result as a `.docx` over Telegram.
+diverse set per region quota, and delivers the result as a `.docx` over
+Telegram.
 
 Built for a narrow editorial focus (science/tech/higher-education coverage
 across Turkey, Central Asia and the South Caucasus) — see `config.py` for the
@@ -54,9 +55,22 @@ to repurpose this for a different beat.
 3. **`sunday_processor_mmr.py`** (cron, weekly) — builds the digest from the
    week's accepted articles. First the week's articles are collapsed into
    **stories**: near-duplicates (cosine ≥ `STORY_COSINE`) become one candidate
-   carrying all its reprints. Then MMR (Maximal Marginal Relevance) selects a
-   diverse, non-redundant top-N per region quota, and the LLM re-tells each
-   winner **in Russian** — from *all* its reprints at once (see steps 4–5).
+   carrying all its reprints. Then the top-N of each region quota is taken by
+   importance, and the LLM re-tells each winner **in Russian** — from *all* its
+   reprints at once (see steps 4–5).
+
+   **MMR is gone as of 16.08.2026** — the module keeps its name only because
+   cron, the bot and six tests import it. The diversity term existed to keep
+   two retellings of one event out of an issue, and that job is already done
+   twice downstream: `_is_semantic_duplicate` on the article embedding (0.90)
+   in `_process_slot`, and `SUMMARY_DUP_COSINE` on the finished retelling.
+   Measured on the frozen basket (`bench.py mmr`, removed with the branch):
+   after those guards, λ=0.5 and λ=1.0 differ by two items out of twenty, mean
+   importance 0.7615 against 0.7622, and **both leave zero pairs above cosine
+   0.90**. λ was not buying diversity — the guards had already delivered it —
+   it was only reshuffling neighbours inside the noise band. Raising λ to 0.8
+   would have been the same as deleting the branch: at 0.8 the pick already
+   equals plain importance ranking exactly.
 
    Story importance blends six factors, none of which costs an API call
    (`config.IMPORTANCE_W_*`; a weight of 0 switches its factor off). One outlet
@@ -232,16 +246,39 @@ Baseline of 16.08.2026, no LLM calls:
 | mean importance of the quota | 0.9119 | 0.6750 | 0.6784 |
 | gap between last taken and first dropped | 0.0078 | 0.0156 | 0.0053 |
 | stories sharing the top scale | 101 | 40 | 31 |
-| MMR ∩ plain importance | 6/7 | 6/7 | 4/6 |
-
 Issue-wide: `scale_top_share` 0.373, mean importance 0.7589 (0.8034 without
 quotas, so quotas cost 0.0445), `repeat_share` 0.140 — that many items of an
 issue repeat an item of an earlier one at cosine ≥ 0.90.
 
 Adding the **novelty** factor (weight 0.20) moves `stale` in SC from 0.868 to
-0.857 and MMR overlap there from 4/6 to 5/6, by swapping one item. Mean
-importance is *not* comparable across different weight sets — `blend`
-renormalizes, so adding any factor rescales the number.
+0.857 by swapping one item. Mean importance is *not* comparable across
+different weight sets — `blend` renormalizes, so adding any factor rescales the
+number.
+
+### Soft quotas: measured and rejected
+
+Per-bucket importance is **not** on a common scale — `topic` is a percentile
+rank within the bucket and `coverage` is normalized by the bucket's own
+maximum, which is 31 outlets in TR and 3 in CA. Any comparison of "0.93 in TR"
+with "0.72 in CA" is a comparison of two different scales. `bench.py quotas`
+therefore scores all 584 stories of the week at once:
+
+| policy | mean importance | composition | worst item |
+| --- | --- | --- | --- |
+| hard 7/7/6 (current) | 0.7736 | TR 7 · CA 7 · SC 6 | 0.6535 |
+| soft 4–10 / 3–9 / 3–8 | 0.7967 | TR 10 · CA 6 · SC 4 | 0.6645 |
+| soft + floor 0.70 | 0.8270 | TR 10 · CA 3 · SC 3 — **16 items, not 20** | 0.6885 |
+| no quota at all | 0.8266 | TR 19 · CA 0 · SC 1 | 0.7448 |
+
+The soft quota does raise the number, and the number is the wrong thing to
+raise. Look at what the three extra Turkish slots buy: two more items about the
+student amnesty, which already holds three slots, one of them with a
+mojibake title (`ÃÄrenci affÄ±nda...`). What they cost: Kazakhstan's NEET
+share falling 6.7 points, an Azerbaijan–Ukraine health agreement, and
+Georgia's national free-textbook programme. Rejected — kept at hard 7/7/6.
+
+The floor variant silently shortens the issue to 16 items, which is a different
+decision from "raise relevance" and belongs to the owner, not to a weight.
 
 `ndcg@7` stays empty until `bench/labels.tsv` exists. It is deliberately not
 faked: every automatic stand-in for relevance here is built out of the same

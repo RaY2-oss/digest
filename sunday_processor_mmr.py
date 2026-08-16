@@ -151,7 +151,15 @@ log = setup_logging()
 # Квоты
 # ---------------------------------------------------------------------------
 QUOTA = {"TR": 7, "CA": 7, "SC": 6}
-MMR_LAMBDA = 0.5
+# MMR отсюда убран 16.08.2026. Диверсити-член вводился, чтобы в выпуск не
+# попали два пересказа одного события, но эту работу делают ещё дважды ниже:
+# _is_semantic_duplicate по эмбеддингу статьи (0.90) в _process_slot и
+# SUMMARY_DUP_COSINE по готовому пересказу. Замер на корзине 09.08–16.08
+# (bench.py mmr): после сторожа выпуск при λ=0.5 и λ=1.0 отличается двумя
+# пунктами из двадцати, средняя важность 0.7615 против 0.7622, а пар с
+# косинусом ≥0.90 в обоих случаях ноль. То есть λ не покупал разнообразия —
+# оно и так было, — а только тасовал соседей по важности внутри шума.
+# Имя файла оставлено: на него ссылаются cron, бот и полдюжины тестов.
 DEFICIT_POOL_CAP = 500  # см. select_representatives(): защита от OOM на LexRank
 LEXRANK_DAMPING = 0.85
 LEXRANK_MAX_ITER = 100
@@ -495,59 +503,14 @@ def _is_semantic_duplicate(
     max_sim = _max_cosine_to_selected(emb, selected_embs)
     return max_sim >= threshold, max_sim
 
-def _mmr_pick(subset: list, n_pick: int, lam: float = MMR_LAMBDA) -> list:
-    """
-    MMR-отбор n_pick статей из subset.
-    Возвращает list of (url, text, emb, pub_date, bucket).
-    """
-    if not subset:
-        return []
-    n_pick = min(n_pick, len(subset))
-    if n_pick <= 0:
-        return []
-    if n_pick == len(subset):
-        return list(subset)
-
-    embeddings = np.vstack([a[2] for a in subset]).astype(np.float32)
-    rel_scores = _importance(subset, embeddings)
-
-    selected_idx = []
-    candidate_mask = np.ones(len(subset), dtype=bool)
-
-    for step in range(n_pick):
-        if step == 0:
-            mmr_scores = rel_scores.copy()
-        else:
-            sel_emb = embeddings[selected_idx]
-            sim_to_sel = _cosine_matrix(embeddings, sel_emb)
-            max_sim = sim_to_sel.max(axis=1)
-            mmr_scores = lam * rel_scores - (1.0 - lam) * max_sim
-
-        mmr_scores_masked = np.where(candidate_mask, mmr_scores, -np.inf)
-        best = int(np.argmax(mmr_scores_masked))
-        selected_idx.append(best)
-        candidate_mask[best] = False
-
-        log.info(
-            " MMR step %d/%d: idx=%d mmr=%.4f imp=%.4f url=%s",
-            step + 1, n_pick, best,
-            float(mmr_scores[best]), float(rel_scores[best]),
-            subset[best][0],
-        )
-
-    return [subset[i] for i in selected_idx]
-
-
 def _rank_by_importance(subset: list) -> list:
     """
-    Сортирует статьи по важности (LexRank + политический вес, см. _importance),
-    БЕЗ диверсити-члена MMR.
+    Сортирует сюжеты по важности (см. _importance).
 
-    Используется для регионального резерва (замена нерелевантных статей):
-    диверсити тут не нужен, т.к. семантические дубликаты уже отсекаются
-    отдельно в _process_slot() через _is_semantic_duplicate() на этапе
-    перебора резерва — значит, важно просто отдавать кандидатов в порядке
-    "следующий самый значимый", а не в порядке из SQL-запроса.
+    Это и есть отбор — и основной, и резервный. Семантические дубликаты
+    отсекает _process_slot() через _is_semantic_duplicate() на том же проходе,
+    поэтому здесь нужно ровно одно: отдавать кандидатов в порядке «следующий
+    самый значимый», а не в порядке из SQL-запроса.
     """
     if len(subset) <= 1:
         return list(subset)
@@ -594,7 +557,7 @@ def select_representatives(articles: list) -> tuple[list, dict]:
         stories = _group_stories(buckets[key])
         log.info(" [%s] %d статей -> %d сюжетов (порог %.2f)",
                  key, len(buckets[key]), len(stories), config.STORY_COSINE)
-        picked = _mmr_pick(stories, quota)
+        picked = _rank_by_importance(stories)[:quota]
         log.info(" [%s] выбрано %d / квота %d", key, len(picked), quota)
         result.extend(picked)
         # Занятыми считаются ВСЕ версии выбранного сюжета, а не только
@@ -619,14 +582,14 @@ def select_representatives(articles: list) -> tuple[list, dict]:
     if deficit > 0:
         all_leftover = [a for a in articles if a[0] not in selected_urls]
         if all_leftover:
-            # Дефицит — редкий случай, точность MMR тут не критична, а
-            # прогонять LexRank/MMR по всей неделе (десятки тысяч статей)
-            # уже роняло процесс OOM'ом (см. инцидент 2026-07-20). Поэтому
-            # сперва режем пул случайной выборкой до разумного размера.
+            # Дефицит — редкий случай, а считать важность по всей неделе
+            # (десятки тысяч статей) уже роняло процесс OOM'ом: LexRank требует
+            # плотную матрицу N×N (см. инцидент 2026-07-20). Поэтому сперва
+            # режем пул случайной выборкой до разумного размера.
             if len(all_leftover) > DEFICIT_POOL_CAP:
                 all_leftover = random.sample(all_leftover, DEFICIT_POOL_CAP)
             log.info("Дефицит %d статей, добираем из leftover+MIX (%d)", deficit, len(all_leftover))
-            extra = _mmr_pick(_group_stories(all_leftover), deficit)
+            extra = _rank_by_importance(_group_stories(all_leftover))[:deficit]
             result.extend(extra)
             selected_urls.update(v[0] for p in extra for v in _versions(p))
 
