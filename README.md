@@ -187,6 +187,41 @@ zero-downtime rebuilds of the database.
 `sentence-transformers`. The CPU this runs on has no AVX, and every path that
 reaches `torch` dies by `SIGILL` — see the same note in `gdelt_rss`'s README.
 
+## Relevance bench (`bench.py`)
+
+Ranking changes are compared against a frozen set, not against memory.
+
+```
+venv/bin/python bench.py build   # freeze the set (rewrites bench/)
+venv/bin/python bench.py run     # metrics -> bench/BASELINE.md
+venv/bin/python bench.py labels  # 198 hard cases for the owner to grade
+```
+
+The set is **one basket, six issues, no 26-week replay**. `cleanup_old_articles.py`
+drops articles older than seven days, so only the current basket ever exists;
+the verdict journal keeps four weeks but stores no text or scale. `output/` holds
+30 `.docx` but only 6 are issues — `sunday_processor_mmr` is a Sunday cron job
+and the rest are test runs, which share six days of window out of seven and
+therefore repeat each other by construction. See `_weekly()`.
+
+Baseline of 16.08.2026, no LLM calls:
+
+| | TR | CA | SC |
+| --- | --- | --- | --- |
+| articles → stories | 879 → 364 | 157 → 129 | 134 → 91 |
+| mean importance of the quota | 0.9119 | 0.6750 | 0.6784 |
+| gap between last taken and first dropped | 0.0078 | 0.0156 | 0.0053 |
+| stories sharing the top scale | 101 | 40 | 31 |
+| MMR ∩ plain importance | 6/7 | 6/7 | 4/6 |
+
+Issue-wide: `scale_top_share` 0.373, mean importance 0.7589 (0.8034 without
+quotas, so quotas cost 0.0445), `repeat_share` 0.140 — that many items of an
+issue repeat an item of an earlier one at cosine ≥ 0.90.
+
+`ndcg@7` stays empty until `bench/labels.tsv` exists. It is deliberately not
+faked: every automatic stand-in for relevance here is built out of the same
+factors being judged and would only measure itself.
+
 ## Shared with `gdelt_rss`
 
 Two modules are not copies but symlinks into the sibling project, which owns
