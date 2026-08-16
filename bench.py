@@ -52,6 +52,7 @@ cleanup_old_articles.py удаляет статьи старше семи дне
     python bench.py labels     # выписать 200 статей на разметку владельцу
     python bench.py selfcheck
 """
+import json
 import os
 import sqlite3
 import sys
@@ -143,6 +144,30 @@ def load():
 # ---------------------------------------------------------------------------
 # 2. Метрики
 # ---------------------------------------------------------------------------
+def apply_scale(basket, path):
+    """Подменить оценки масштаба на снятые другой редакцией промпта судьи.
+
+    Ровное распределение оценок — ещё не польза; польза видна только на
+    отборе. Файл делает `bench_judge.py --grade-basket`, число делений едет
+    вместе с оценками, потому что _SCALE_VALUE обязан их нормировать под ту
+    же шкалу, а не под ту, что зашита в processor.
+    """
+    import sunday_processor_mmr as P
+    with open(path, encoding="utf-8") as fh:
+        d = json.load(fh)
+    k = int(d["levels"])
+    P._SCALE_VALUE = {g: (g - 1) / (k - 1) for g in range(1, k + 1)}
+    scale = d["scale"]
+    out = dict(basket)
+    out["scale"] = np.array(
+        [scale.get(str(u), None) if scale.get(str(u)) is not None else -1
+         for u in basket["url"]], dtype=np.int8)
+    graded = int((out["scale"] > 0).sum())
+    print("масштаб из %s: %d делений, оценено %d из %d"
+          % (os.path.basename(path), k, graded, len(out["scale"])))
+    return out
+
+
 def _articles(basket):
     """Снимок -> список кортежей в формате load_week_articles()."""
     sys.path.insert(0, BASE)
@@ -287,8 +312,13 @@ def _measure(basket, issues, quota, labels):
 
     res = {"buckets": {}, "n_articles": len(arts)}
     sc_all = [a[6] for a in arts if a[6] is not None]
-    res["scale_top_share"] = (sum(1 for s in sc_all if s == 3) / len(sc_all)
+    # Верхний разряд — максимум ШКАЛЫ, а не тройка: у пятибалльной редакции
+    # судьи тройка это середина, и захардкоженная 3 показала бы улучшение там,
+    # где его нет.
+    top = max(P._SCALE_VALUE) if P._SCALE_VALUE else 3
+    res["scale_top_share"] = (sum(1 for s in sc_all if s == top) / len(sc_all)
                               if sc_all else float("nan"))
+    res["scale_levels"] = top
 
     picked_all, imp_all = [], []
     for bucket, q in quota.items():
@@ -384,8 +414,10 @@ def _fmt(res):
     return "\n".join(L)
 
 
-def run():
+def run(scale_path=None):
     b, i = load()
+    if scale_path:
+        b = apply_scale(b, scale_path)
     res = measure(b, i)
     text = _fmt(res)
     print(text)
@@ -610,6 +642,8 @@ def _selfcheck():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if cmd == "run" and len(sys.argv) > 2:      # bench.py run bench/scale_v2.json
+        sys.exit(run(sys.argv[2]))
     {"build": build, "run": run, "labels": labels_task, "sweep": sweep,
      "quotas": quotas,
      "selfcheck": _selfcheck}[cmd]()

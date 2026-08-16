@@ -314,13 +314,45 @@ def sample(n, seed=7):
     return picked, texts, [int(b["scale"][i]) for i in picked]
 
 
+def grade_basket(model, variant, out_path, limit=None, workers=3):
+    """Оценить масштаб у ВСЕЙ корзины и сложить рядом с набором.
+
+    Ровное распределение на выборке из 120 — ещё не польза. Польза видна
+    только на отборе: разрешается ли верхушка, где сейчас 101 сюжет из 364
+    делят верхний разряд. Для этого нужна оценка у каждой статьи, а не у
+    стратифицированной сотни, — отсюда полный прогон на час.
+    """
+    b = dict(np.load(os.path.join(BASE, "bench", "basket.npz"),
+                     allow_pickle=True))
+    urls = [str(u) for u in b["url"]][:limit]
+    texts = ["%s\n%s" % (b["title"][k], b["text"][k]) for k in range(len(urls))]
+    levels = prompts(variant)[2]
+    t0 = time.time()
+    verdicts, _raw = judge(model, variant, texts, seed=0, workers=workers)
+    scale = {u: (v[1] if v and v[1] is not None else None)
+             for u, v in zip(urls, verdicts)}
+    got = [s for s in scale.values() if s is not None]
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump({"model": model, "variant": variant, "levels": levels,
+                   "scale": scale}, fh, ensure_ascii=False)
+    print("оценено %d из %d за %ds, распределение %s -> %s"
+          % (len(got), len(urls), round(time.time() - t0),
+             {g: got.count(g) for g in range(1, levels + 1)}, out_path))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=120)
     ap.add_argument("--model", default="qwen3.5:9b")
     ap.add_argument("--variants", default="v1,v2,v2a")
     ap.add_argument("--out", default=os.path.join(BASE, "bench", "judge_runs.json"))
+    ap.add_argument("--grade-basket", default=None,
+                    help="оценить масштаб всей корзины этой редакцией промпта")
+    ap.add_argument("--limit", type=int, default=None)
     a = ap.parse_args()
+
+    if a.grade_basket:
+        return grade_basket(a.model, a.grade_basket, a.out, a.limit)
 
     idx, texts, prod = sample(a.n)
     print("статей: %d (боевые оценки 1/2/3: %d/%d/%d), модель %s"
