@@ -52,13 +52,19 @@ cleanup_old_articles.py удаляет статьи старше семи дне
     python bench.py selfcheck
 """
 import os
-import re
 import sqlite3
 import sys
 
 import numpy as np
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
+
+import issue_archive  # noqa: E402  (после sys.path — файл лежит рядом)
+
+# Разбор .docx и понятие «настоящий выпуск» — в issue_archive: тем же знанием
+# пользуется отбор, и двух копий регулярного выражения здесь быть не должно.
+_weekly = issue_archive.weekly
 BENCH = os.path.join(BASE, "bench")
 BASKET = os.path.join(BENCH, "basket.npz")
 ISSUES = os.path.join(BENCH, "issues.npz")
@@ -93,84 +99,17 @@ def _freeze_basket(conn):
     }
 
 
-# «12. 15.08.2026 — Заголовок пункта»
-_ITEM_RE = re.compile(r"^(\d+)\.\s+(\d{2}\.\d{2}\.\d{4})\s+—\s+(.+)$")
-_DOC_RE = re.compile(r"^digest_(\d{4}-\d{2}-\d{2})(?:-(\d+))?\.docx$")
-
-
-def _parse_issue(path):
-    """.docx выпуска -> [{'title':.., 'summary':.., 'urls':[..], 'date':..}]."""
-    import docx
-    pars = [p.text.strip() for p in docx.Document(path).paragraphs]
-    items, cur = [], None
-    for t in pars:
-        m = _ITEM_RE.match(t)
-        if m:
-            if cur:
-                items.append(cur)
-            cur = {"date": m.group(2), "title": m.group(3), "summary": "", "urls": []}
-        elif cur is not None and t.startswith("URL:"):
-            cur["urls"] = [u.strip() for u in t[4:].split(";") if u.strip()]
-        elif cur is not None and t and not cur["summary"]:
-            cur["summary"] = t
-    if cur:
-        items.append(cur)
-    return items
-
-
-def _issue_files():
-    """По одному .docx на дату: повторный прогон того же дня — не новый выпуск.
-
-    Берётся ПОСЛЕДНИЙ файл даты (digest_2026-08-16-6.docx новее, чем
-    digest_2026-08-16.docx): именно он ушёл читателю.
-    """
-    out = {}
-    for name in os.listdir(os.path.join(BASE, "output")):
-        m = _DOC_RE.match(name)
-        if m:
-            rank = int(m.group(2) or 0)
-            date = m.group(1)
-            if date not in out or rank > out[date][0]:
-                out[date] = (rank, name)
-    return [(d, os.path.join(BASE, "output", n)) for d, (_, n) in sorted(out.items())]
-
-
-def _weekly(dates):
-    """Из всех дат — только настоящие выпуски.
-
-    sunday_processor_mmr стоит в cron на воскресенье (`0 18 * * 0`), а в
-    output/ лежат ещё и проверочные прогоны будних дней: 30 файлов на 6
-    выпусков. Читатель получил воскресные, и повтор считать надо по ним —
-    два прогона соседних дней делят шесть дней окна из семи и совпадают почти
-    целиком по построению, а не от плохого отбора.
-    """
-    import datetime
-    days = sorted({datetime.date.fromisoformat(str(d)) for d in dates})
-    if not days:
-        return set()
-    wd = days[-1].weekday()
-    return {d.isoformat() for d in days if d.weekday() == wd}
-
-
 def _freeze_issues():
-    import embedder
-    eng = embedder.get_engine()
-    dates, titles, summaries, texts = [], [], [], []
-    for date, path in _issue_files():
-        for it in _parse_issue(path):
-            dates.append(date)
-            titles.append(it["title"])
-            summaries.append(it["summary"])
-            # Тот же префикс и та же склейка, что в _summary_embedding:
-            # иначе архив и живой пункт окажутся в разных углах пространства.
-            texts.append("passage: %s. %s" % (it["title"], it["summary"]))
-    emb = eng.encode(texts, batch_size=16, convert_to_numpy=True)
-    return {
-        "issue_date": np.array(dates, dtype=object),
-        "title": np.array(titles, dtype=object),
-        "summary": np.array(summaries, dtype=object),
-        "emb": np.asarray(emb, dtype=np.float32),
-    }
+    """Замороженная копия архива выпусков.
+
+    Разбор и эмбеддинги живут в issue_archive — том же модуле, которым
+    пользуется отбор. Здесь только снимок: набор обязан не двигаться, а
+    output/ и его кэш живут своей жизнью.
+    """
+    import issue_archive
+    a = issue_archive.load(only_weekly=False)
+    return {"issue_date": a["issue_date"], "title": a["title"],
+            "summary": a["summary"], "emb": a["emb"]}
 
 
 def build():
@@ -313,9 +252,32 @@ def _stale(stories, issues):
     return float((S @ A.T).max(axis=1).mean())
 
 
-def measure(basket, issues, quota=None, lam=None, labels=None):
-    """Все метрики стенда одним проходом. Возвращает плоский dict."""
-    sys.path.insert(0, BASE)
+def measure(basket, issues, quota=None, lam=None, labels=None, weights=None):
+    """Все метрики стенда одним проходом. Возвращает плоский dict.
+
+    weights — временная подмена config.IMPORTANCE_W_*, чтобы гонять варианты
+    без правки файла: {"NOVELTY": 0.1}.
+    """
+    import config
+    import sunday_processor_mmr as P
+
+    # Отбор в стенде не должен видеть свежего выпуска: он собран из этой же
+    # корзины, и его пункты — не «прошлое», а собственный ответ отбора.
+    P._ARCHIVE = _archive_emb(issues)
+
+    saved = {}
+    for k, v in (weights or {}).items():
+        name = "IMPORTANCE_W_" + k
+        saved[name] = getattr(config, name)
+        setattr(config, name, v)
+    try:
+        return _measure(basket, issues, quota, lam, labels)
+    finally:
+        for name, v in saved.items():
+            setattr(config, name, v)
+
+
+def _measure(basket, issues, quota, lam, labels):
     import sunday_processor_mmr as P
 
     quota = dict(P.QUOTA if quota is None else quota)
@@ -357,6 +319,7 @@ def measure(basket, issues, quota=None, lam=None, labels=None):
                                   if top_sc is not None else 0),
             "stale": _stale(pure, issues),
             "mmr_overlap": len({a[0] for a in pure} & {a[0] for a in mmr}),
+            "picked": [a[0] for a in pure],
         }
         if labels:
             gains = [labels.get(stories[i][0], 0) for i in order]
@@ -387,10 +350,16 @@ def measure(basket, issues, quota=None, lam=None, labels=None):
 
 
 def _fmt(res):
+    import config
     L = []
     L.append("корзина: %d статей | выпусков: %d (%d пунктов) | ручных меток: %d"
              % (res["n_articles"], res["n_issues"], res["n_issue_items"],
                 res["labels"]))
+    # Числа без весов не значат ничего: важность считается по ним, и строка
+    # ниже — единственное, что отличает один замер от другого.
+    L.append("веса: " + " ".join(
+        "%s=%.2f" % (k[len("IMPORTANCE_W_"):].lower(), getattr(config, k))
+        for k in sorted(dir(config)) if k.startswith("IMPORTANCE_W_")))
     L.append("scale_top_share = %.3f   (доля троек среди оценённых статей)"
              % res["scale_top_share"])
     L.append("mean_importance = %.4f  без квот %.4f  цена квоты %.4f"
@@ -435,7 +404,58 @@ def run():
 
 
 # ---------------------------------------------------------------------------
-# 3. Задание на ручную разметку
+# 3. Перебор веса фактора
+# ---------------------------------------------------------------------------
+def sweep(factor="NOVELTY", grid=(0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40)):
+    """Что даёт вес фактора: цифры и, главное, СПИСОК заменённых сюжетов.
+
+    Одних средних мало. Фактор с малым весом двигает важность у всех и не
+    меняет ни одного выбора — арифметически «улучшение», для читателя ноль.
+    Поэтому рядом с числами печатается, кто вышел и кто вошёл: только по ним
+    видно, повторы ли уезжают.
+    """
+    basket, issues = load()
+    base = measure(basket, issues, weights={factor: 0.0})
+    base_pick = {k: list(b["picked"]) for k, b in base["buckets"].items()}
+    titles = dict(zip((str(u) for u in basket["url"]),
+                      (str(t) for t in basket["title"])))
+    A = _archive_emb(issues)
+    emb = dict(zip((str(u) for u in basket["url"]), basket["emb"]))
+
+    def near(url):
+        """Насколько сюжет близок к прежним выпускам — для строки отчёта."""
+        v = emb.get(url)
+        if v is None or not len(A):
+            return float("nan")
+        v = v / (np.linalg.norm(v) + 1e-10)
+        return float((A @ v).max())
+
+    print("вес   важность  близость   заменено сюжетов")
+    lines = []
+    for w in grid:
+        r = measure(basket, issues, weights={factor: w})
+        changed = {k: (set(base_pick[k]) - set(b["picked"]),
+                       set(b["picked"]) - set(base_pick[k]))
+                   for k, b in r["buckets"].items()}
+        n_ch = sum(len(a) for a, _b in changed.values())
+        stale = float(np.mean([b["stale"] for b in r["buckets"].values()]))
+        print("%.2f  %.4f    %.4f     %d"
+              % (w, r["mean_importance"], stale, n_ch))
+        lines.append((w, r, changed))
+
+    for w, _r, changed in lines:
+        if not any(a for a, _b in changed.values()):
+            continue
+        print("\n=== вес %.2f" % w)
+        for k, (out, inn) in changed.items():
+            for u in sorted(out):
+                print("  - %s  близость %.3f  %.70s" % (k, near(u), titles.get(u, u)))
+            for u in sorted(inn):
+                print("  + %s  близость %.3f  %.70s" % (k, near(u), titles.get(u, u)))
+
+
+# ---------------------------------------------------------------------------
+# 4. Задание на ручную разметку
 # ---------------------------------------------------------------------------
 def labels_task(n=200):
     """200 статей владельцу на разметку — не случайных, а трудных.
@@ -487,10 +507,6 @@ def _selfcheck():
     assert _ndcg_at_k([0, 0, 0], 3) != _ndcg_at_k([0, 0, 0], 3) or True  # nan
     assert np.isnan(_ndcg_at_k([0, 0], 2))
 
-    m = _ITEM_RE.match("12. 15.08.2026 — Заголовок")
-    assert m and m.group(2) == "15.08.2026" and m.group(3) == "Заголовок"
-    assert not _ITEM_RE.match("URL: https://x")
-
     # Повтор ловится только назад по времени и только между разными выпусками.
     v = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], np.float32)
     iss = {"emb": v, "issue_date": np.array(["2026-01-04", "2026-01-11",
@@ -511,5 +527,5 @@ def _selfcheck():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    {"build": build, "run": run, "labels": labels_task,
+    {"build": build, "run": run, "labels": labels_task, "sweep": sweep,
      "selfcheck": _selfcheck}[cmd]()

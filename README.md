@@ -58,7 +58,7 @@ to repurpose this for a different beat.
    diverse, non-redundant top-N per region quota, and the LLM re-tells each
    winner **in Russian** — from *all* its reprints at once (see steps 4–5).
 
-   Story importance blends five factors, none of which costs an API call
+   Story importance blends six factors, none of which costs an API call
    (`config.IMPORTANCE_W_*`; a weight of 0 switches its factor off). One outlet
    gets one vote in every one of them: `importance.publisher()` collapses both
    domains and wire-syndication networks, `lexrank` zeroes intra-domain edges,
@@ -97,6 +97,26 @@ to repurpose this for a different beat.
      and a murder case to the top: those were let through by the LLM judge, and
      coverage only amplified them. The factor stays off while no artifact is
      trained.
+   - **novelty** — the only factor that looks *outside* the week's window
+     (`issue_archive.py`). The other five all measure one family, "is this our
+     subject and how many wrote about it", so a follow-up is indistinguishable
+     from a first report: 14% of items repeat an item of an earlier issue at
+     cosine ≥ 0.90. Past issues are parsed out of `output/*.docx`, embedded
+     once and cached; a story's novelty is 1 below `NOVELTY_FLOOR` and falls
+     linearly to 0 at an exact match.
+
+     It is a tail penalty, not a slope, and that was the measurement's main
+     lesson. Plain `1 − cosine` moved every story at once and changed no
+     selection at all up to weight 0.10 (`bench.py sweep`). And the floor
+     cannot be set at the distribution tail either: one repeated event had
+     *eight* versions spread over cosine 0.888–0.963, so a floor of 0.90
+     demoted seven of them and let the eighth — the same story in Armenian —
+     take the freed slot. The floor has to sit below the weakest member of a
+     repeat cluster or the factor shuffles versions instead of removing the
+     repeat. At 0.88 (54 of 1172 articles) it swaps one item of twenty:
+     out goes the Firebird AI-factory story already printed on 09.08, in comes
+     Georgia's free-textbook programme. That single swap is the honest size of
+     the effect on the one basket that still exists.
 4. **Retelling a story, not an article** — the prompt carries up to
    `RETELL_MAX_VERSIONS` reprints of the same story under a shared character
    budget (`RETELL_CHARS_*`), and every URL that went into the prompt is
@@ -217,6 +237,11 @@ Baseline of 16.08.2026, no LLM calls:
 Issue-wide: `scale_top_share` 0.373, mean importance 0.7589 (0.8034 without
 quotas, so quotas cost 0.0445), `repeat_share` 0.140 — that many items of an
 issue repeat an item of an earlier one at cosine ≥ 0.90.
+
+Adding the **novelty** factor (weight 0.20) moves `stale` in SC from 0.868 to
+0.857 and MMR overlap there from 4/6 to 5/6, by swapping one item. Mean
+importance is *not* comparable across different weight sets — `blend`
+renormalizes, so adding any factor rescales the number.
 
 `ndcg@7` stays empty until `bench/labels.tsv` exists. It is deliberately not
 faked: every automatic stand-in for relevance here is built out of the same

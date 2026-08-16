@@ -366,13 +366,43 @@ def _group_stories(subset: list) -> list:
     return stories
 
 
-def _importance(subset: list, embeddings: np.ndarray) -> np.ndarray:
-    """Важность сюжетов корзины в [0, 1] — пять факторов, без отдельного LLM.
+_ARCHIVE = None
+
+
+def _archive():
+    """Пункты прошлых выпусков — один раз на процесс.
+
+    В боевом прогоне сегодняшнего .docx в output/ ещё нет: он собирается
+    ПОСЛЕ отбора. Поэтому обрезать архив по дате здесь не нужно, а стенду,
+    который считает задним числом, нужно — он передаёт свой архив явно.
+    """
+    global _ARCHIVE
+    if _ARCHIVE is None:
+        try:
+            import datetime
+
+            import issue_archive
+            # Строго ДО сегодня. В боевом прогоне это ничего не меняет
+            # (сегодняшнего файла ещё нет), а повторный прогон того же дня
+            # иначе увидел бы собственный первый результат целиком повтором и
+            # выдал бы двадцать других пунктов.
+            _ARCHIVE = issue_archive.load(
+                before=datetime.date.today().isoformat())["emb"]
+        except Exception:  # noqa: BLE001
+            log.exception("Архив выпусков недоступен, новизна выключена")
+            _ARCHIVE = np.zeros((0, config.EMBEDDING_DIM), np.float32)
+    return _ARCHIVE
+
+
+def _importance(subset: list, embeddings: np.ndarray,
+                archive: np.ndarray | None = None) -> np.ndarray:
+    """Важность сюжетов корзины в [0, 1] — шесть факторов, без отдельного LLM.
 
         scale    — национальный масштаб события глазами судьи (1..3);
         coverage — сколько РАЗНЫХ изданий написали о сюжете;
         topic    — вероятность локального предфильтра «это наша тема»;
         entity   — политический вес субъектов (см. entities.py);
+        novelty  — 1 минус близость к пунктам ПРОШЛЫХ выпусков;
         lexrank  — тематическая центральность в недельном окне.
 
     Веса — в config.IMPORTANCE_W_*; ноль выключает фактор. Факторы scale и
@@ -411,10 +441,24 @@ def _importance(subset: list, embeddings: np.ndarray) -> np.ndarray:
     w_scale = (config.IMPORTANCE_W_SCALE
                if any(s is not None for s in raw_scale) else 0.0)
 
+    # Новизна — единственный фактор, который смотрит НАРУЖУ недельного окна.
+    # Остальные пять меряют одно семейство: «про нашу ли это тему и много ли
+    # писали». Сюжет-продолжение по ним неотличим от первого сообщения.
+    w_nov = config.IMPORTANCE_W_NOVELTY
+    if w_nov:
+        import issue_archive
+        arc = _archive() if archive is None else archive
+        nov = issue_archive.novelty(embeddings, arc)
+        if not len(arc):
+            w_nov = 0.0     # архива нет — фактор молчит, а не ставит всем 1.0
+    else:
+        nov = np.zeros(len(subset))
+
     factors = [(w_lex, lex),
                (config.IMPORTANCE_W_COVERAGE, cov),
                (w_ent, ent),
-               (w_scale, sc)]
+               (w_scale, sc),
+               (w_nov, nov)]
 
     p = prefilter.score(config.PREFILTER_PATH, embeddings)
     if p is not None:

@@ -305,6 +305,7 @@ IMPORTANCE_W_COVERAGE = 0.25
 IMPORTANCE_W_ENTITY = 0.15   # 0.0 — выключить фактор, не трогая код
 IMPORTANCE_W_TOPIC = 0.20
 IMPORTANCE_W_SCALE = 0.40
+IMPORTANCE_W_NOVELTY = 0.20  # см. issue_archive.novelty и bench.py sweep
 
 # Пересказ сюжета: в промпт уходят тексты нескольких его версий сразу.
 # Разные редакции сохраняют разные детали (цифры, цитаты, имена), поэтому
