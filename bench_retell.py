@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """bench_retell.py — полный промпт пересказа против урезанного.
 
+ИТОГ (60 сюжетов, qwen3:8b, 17.08.2026): урезание ОТВЕРГНУТО, боевой промпт
+оставлен как есть. Отказов поровну — 18 из 60 у полного, 18 у урезанного;
+длина у урезанного больше на 3.5 ± 1.8 слова. Третье плечо показало, чьё это
+плечо: без «обоснования длины» пересказ растёт, с ним (снято два других
+правила) разница 1.2 ± 1.8, то есть ноль. Правило, чей сторож молчит неделю,
+и оказалось причиной молчания сторожа. Дальше — метод и его границы.
+
 Метод из аудита: прогнать один набор сюжетов двумя редакциями системного
 промпта и сравнить по срабатываниям сторожей. У метода есть граница, которую
 надо назвать сразу: **правило без сторожа не проверяется никак**. В промпте
@@ -27,9 +34,15 @@
 на сорока сюжетах это ноль или один случай, и различить редакции по одному
 сторожу нельзя. Различима только СУММА отказов (около 31% попыток) и
 распределение длин — длина есть у каждого ответа, а не у одного из тридцати.
+Прогон это подтвердил: «согласование» читается 10/5/5 по плечам, «смешение
+скриптов» 2/5/5 — в разные стороны, при равных суммах.
+
+И длина сравнивается ПАРНО, один сюжет против себя же. Медианы плеч (87
+против 92) не решают ничего: сюжеты разной сложности, разброс между ними —
+десятки слов, и он полностью съедает разницу в четыре слова между редакциями.
 
 Запуск:
-    python bench_retell.py --n 40 --model qwen3:8b
+    python bench_retell.py --n 60 --model qwen3:8b
 """
 import argparse
 import collections
@@ -71,20 +84,35 @@ _CUTS = {
 }
 
 
-def prompts():
-    """-> {'full': текст, 'lean': текст}. Урезание проверяется, а не верится:
+# Какое плечо что снимает. lean2 появилось после первого прогона: урезание
+# всеми тремя кусками сразу не меняло отказов, но удлиняло пересказ на 4 слова,
+# и списать это на «обоснование длины» можно было только рассуждением — из
+# трёх снятых правил про длину говорит одно. Плечо, где снято два других,
+# превращает рассуждение в замер.
+_ARMS = {
+    "full": (),
+    "lean": ("не-украинский", "надпись-на-объекте", "обоснование-длины"),
+    "lean2": ("не-украинский", "надпись-на-объекте"),
+}
+
+
+def prompts(arms=None):
+    """-> {имя плеча: текст промпта}. Урезание проверяется, а не верится:
     если кусок в промпте не найден дословно, замер падает здесь, а не выдаёт
     два одинаковых промпта под разными именами."""
     import sunday_processor_mmr as P
     full = P._SYSTEM_PROMPT_RETELL
-    lean = full
-    for name, chunk in _CUTS.items():
-        plain = chunk.replace("\\\n", "")
-        if plain not in lean:
-            raise SystemExit("Кусок «%s» в промпте не найден — правило "
-                             "переписали, поправь _CUTS." % name)
-        lean = lean.replace(plain, "")
-    return {"full": full, "lean": lean}
+    out = {}
+    for arm in (arms or _ARMS):
+        text = full
+        for name in _ARMS[arm]:
+            plain = _CUTS[name].replace("\\\n", "")
+            if plain not in text:
+                raise SystemExit("Кусок «%s» в промпте не найден — правило "
+                                 "переписали, поправь _CUTS." % name)
+            text = text.replace(plain, "")
+        out[arm] = text
+    return out
 
 
 def ask(model, system, user, schema, timeout=900):
@@ -130,7 +158,13 @@ def sample(n):
 
 
 def run_arm(model, system, stories, workers=3):
-    """-> (список причин отказа или None, список длин пересказа в словах)."""
+    """-> (причины отказа или None, длины в словах — обе по индексу сюжета).
+
+    Длина возвращается ВЫРОВНЕННОЙ по сюжетам, а не сжатым списком: сюжеты
+    разной длины и сложности, и разброс между ними больше разницы между
+    редакциями промпта. Различима она только попарно — один сюжет, две
+    редакции, — и для этого нужен индекс, а не медиана.
+    """
     import sunday_processor_mmr as P
 
     def one(story):
@@ -150,7 +184,7 @@ def run_arm(model, system, stories, workers=3):
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         pairs = list(ex.map(one, stories))
-    return [p[0] for p in pairs], [p[1] for p in pairs if p[1]]
+    return [p[0] for p in pairs], [p[1] for p in pairs]
 
 
 def _rule(reason):
@@ -199,12 +233,14 @@ def main():
         reasons, words = run_arm(a.model, system, stories)
         hits = collections.Counter(_rule(r) for r in reasons)
         passed = hits.pop("прошло", 0)
+        got = [w for w in words if w]
         report[name] = {
             "chars": len(system), "n": len(reasons), "passed": passed,
             "rejected": len(reasons) - passed, "by_rule": dict(hits),
-            "words_median": float(np.median(words)) if words else None,
-            "words_p90": float(np.percentile(words, 90)) if words else None,
-            "words_over_120": sum(1 for w in words if w > 120),
+            "words": words,          # по индексу сюжета, None = ответа нет
+            "words_median": float(np.median(got)) if got else None,
+            "words_p90": float(np.percentile(got, 90)) if got else None,
+            "words_over_120": sum(1 for w in got if w > 120),
             "seconds": round(time.time() - t0),
         }
         r = report[name]
@@ -217,17 +253,51 @@ def main():
               % (r["words_median"] or 0, r["words_p90"] or 0,
                  r["words_over_120"]))
 
+    paired(report)
     with open(a.out, "w", encoding="utf-8") as fh:
         json.dump({"model": a.model, "report": report}, fh,
                   ensure_ascii=False, indent=1)
     print("\n-> %s" % a.out)
 
 
+def paired(report):
+    """Разница длин на ОДНИХ И ТЕХ ЖЕ сюжетах.
+
+    Медианы двух рук (85 против 89 на первом прогоне) ничего не решают:
+    сюжеты разной сложности, и между ними разброс в десятки слов. Одна и та
+    же новость, пересказанная двумя редакциями промпта, — единственная пара,
+    где видно саму редакцию. Знаковый тест, а не t: длины ограничены
+    бюджетом сверху и распределены несимметрично.
+    """
+    full = report.get("full")
+    if not full:
+        return
+    print("\n=== парно с полным промптом, по одним и тем же сюжетам")
+    for name, arm in report.items():
+        if name == "full":
+            continue
+        d = [(b - a) for a, b in zip(full["words"], arm["words"]) if a and b]
+        if len(d) < 2:
+            continue
+        up = sum(1 for x in d if x > 0)
+        down = sum(1 for x in d if x < 0)
+        # Стандартная ошибка среднего разности — так видно, отличается ли сдвиг
+        # от нуля вообще, а знаки говорят, в одну ли сторону он у большинства.
+        se = float(np.std(d, ddof=1) / len(d) ** 0.5)
+        print("  %-6s n=%d: длиннее на %+.1f ± %.1f слов (%.1f сигмы), "
+              "длиннее у %d, короче у %d"
+              % (name, len(d), float(np.mean(d)), se,
+                 abs(np.mean(d)) / se if se else 0, up, down))
+
+
 def _selfcheck():
     v = prompts()
-    assert len(v["lean"]) < len(v["full"]), (len(v["lean"]), len(v["full"]))
+    assert len(v["lean"]) < len(v["lean2"]) < len(v["full"]), (
+        len(v["lean"]), len(v["lean2"]), len(v["full"]))
     assert "Ukrainian" not in v["lean"] and "Ukrainian" in v["full"]
     assert "Bahçe Görevlisi" not in v["lean"]
+    assert "count the words before" in v["lean2"], "lean2 бюджет длины хранит"
+    assert "count the words before" not in v["lean"]
     assert "90–120 WORDS" in v["lean"], "бюджет длины снимать нельзя"
     assert "TÜBİTAK" in v["lean"], "правила со стреляющими сторожами остаются"
     assert _rule(None) == "прошло"

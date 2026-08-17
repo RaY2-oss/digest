@@ -226,6 +226,30 @@ to repurpose this for a different beat.
    ordinary Russian compounds missing from frequency lists), the second alone
    would flag «университет» next to Turkish `üniversite`. Together, on 487
    shipped items: two flagged, both the real thing.
+
+   The retelling prompt is long — about forty rules, 8055 characters — and
+   halving it was measured and **rejected** (`bench_retell.py`, 60 stories,
+   local model, each arm compared against the full prompt on the same
+   stories). Rules were nominated for removal by their guards' silence over a
+   week of logs, and the arm that dropped three of them rejected exactly as
+   many retellings as the full prompt: 18 of 60 against 18 of 60. So the
+   prompt's length costs nothing in quality — and buys nothing to remove.
+
+   The interesting half is where the guard's silence comes from. Dropping the
+   three rules made retellings 3.5 ± 1.8 words longer (35 stories of 60
+   longer, 24 shorter; an earlier independent run said 4.0 ± 1.7, 39 of 59).
+   A third arm keeping only the length-budget justification lands at
+   1.2 ± 1.8 — indistinguishable from the full prompt. The one rule whose
+   guard never fires is the reason it never fires. A silent guard means
+   either "the rule is useless" or "the rule works"; only the ablation tells
+   them apart, and the log alone would have removed the wrong one.
+
+   Per-guard counts are not readable at this size and the stand says so up
+   front: individual guards fire on 1–3% of attempts, so only the sum of
+   rejections and the length distribution have any power at n=60. The run
+   bears that out — «согласование» reads 10 / 5 / 5 across the arms and
+   «смешение скриптов» 2 / 5 / 5, in opposite directions, with the sums
+   equal.
 6. **`word_generator.py`** renders the selection to a `.docx`.
 7. **`telegram_sender.py`** delivers it to the configured chat.
 8. **`telegram_bot_listener.py`** — long-polling bot exposing `/rundigest`
