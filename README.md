@@ -157,6 +157,16 @@ to repurpose this for a different beat.
      answered" and "the answer was not JSON", which is what made the run take
      an hour to read; the judge now logs the head of the response it could not
      parse.
+
+     That run finished at 13:04 and graded 38 articles **7/1/17/11/2** over the
+     five levels — the intermediate grades the old rubric could not express are
+     there (12 rows in the whole table carry 2 or 4, all of them from this run;
+     the migration relabelled 1→1, 2→3, 3→5 and could not invent them), and the
+     top grade holds 2 of 38 against 30% before. This confirms the prompt
+     reaches production and nothing more: at n=38 the top share of 0.053 has a
+     95% interval of roughly 0.01–0.18 and cannot be told from the bench's
+     0.180. Level 2 drew one article of 38 and is the thing to watch — if it
+     stays empty over a few hundred, its anchor is the one to rewrite.
    - **topic** — the local classifier's probability (see `prefilter.py` below),
      reused here as a continuous "is this our subject at all" measure. Without
      it the thin CA/SC buckets floated chess politics, party-building reports
