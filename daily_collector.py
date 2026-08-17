@@ -352,6 +352,12 @@ def _judge_call(texts):
         return None
     shuffled = _parse_judge(raw, len(texts))
     if shuffled is None:
+        # Провайдер ответил, но не JSON-объектом. Причина видна только в самом
+        # ответе, а его нигде не было: разбор прогона 17.08 упёрся в то, что
+        # оба исхода — «никто не ответил» и «ответ не разобран» — писали в лог
+        # одну и ту же строку.
+        log.warning("Судья: ответ на %d статей не разобран, начало: %.200s",
+                    len(texts), str(raw).replace("\n", " "))
         return None
     out = [None] * len(texts)
     for i, k in enumerate(order):
@@ -384,8 +390,8 @@ def judge_parallel(texts):
     for i, chunk in enumerate(chunks):
         r = results[i]
         if r is None:
-            log.warning("Батч %d: ответа нет ни от одного провайдера — "
-                        "%d статей уходят в pending", i, len(chunk))
+            log.warning("Батч %d: решения нет — %d статей уходят в pending",
+                        i, len(chunk))
             flat.extend([None] * len(chunk))
             undecided += len(chunk)
         else:

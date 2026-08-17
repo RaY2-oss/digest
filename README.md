@@ -141,6 +141,22 @@ to repurpose this for a different beat.
      landing in the tail and keeps being under-graded. Shuffling turns a bias
      into noise. Measured on the local model — the cloud judge's number is its
      own, the direction is not.
+
+     The first production run under the new prompt (17.08, 12:00 UTC) left
+     **30 of 150** articles undecided, against 10 of 166 and 4 of 57 earlier
+     the same day, and that reads as a regression from the nested response
+     format until the loss is counted the right way. It is whole batches, not
+     articles: 3 batches of 15 came back unparseable, and the chronic rate over
+     22 earlier runs is 37 batches of 273 — **13.6%**, so 20% is under one
+     sigma. Per-article parse failures, the ones the new format would actually
+     produce, are **0 of 150** post-change against 18 of 2643 before. An
+     undecided batch goes to `pending` and is drained at the head of the next
+     run, so the cost is a six-hour delay, not a lost article, and an in-run
+     retry would spend quota to buy that back. Nothing was changed but the
+     log line: "no provider answered" was printed for both "no provider
+     answered" and "the answer was not JSON", which is what made the run take
+     an hour to read; the judge now logs the head of the response it could not
+     parse.
    - **topic** — the local classifier's probability (see `prefilter.py` below),
      reused here as a continuous "is this our subject at all" measure. Without
      it the thin CA/SC buckets floated chess politics, party-building reports
