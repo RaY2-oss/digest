@@ -87,6 +87,39 @@ GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 # нечего — в отличие от OpenRouter, где это делает суффикс ":free".
 FALLBACK_POOL_SIZE = 5
 
+# Бесплатная ступень перед своей моделью: шлюз llm7.io. Ключ не нужен вообще —
+# анонимный тариф отдаёт часть моделей без регистрации (docs.llm7.io/limits:
+# 1 запрос в секунду, 10 в минуту, 60 в час, 500 тыс. токенов в сутки; почта в
+# dash.llm7.io поднимает до 40/мин и 1 млн токенов). Батч судьи весит ~24 тыс.
+# знаков, суточная работа — около 40 батчей, то есть ~360 тыс. токенов: в
+# анонимный лимит помещается, в лимит с почтой — с запасом.
+#
+# В кольцо round-robin НЕ входит по той же причине, что и локальная модель:
+# пока у облака остались суточные лимиты, качество там выше. Включается там же,
+# где локальная, — по quota.all_cloud_exhausted(), и пробуется ПЕРЕД ней.
+#
+# Замер 17.08.2026 (bench_providers.py, 90 статей корзины, батчи по 10, отсидка
+# Retry-After как в кольце): обе модели разобрали 9 батчей из 9 и решили 90
+# статей из 90; регион совпал с боевым судьёй в 0.97-0.98 принятых, средняя
+# ошибка масштаба 0.92 (gemini-3.1-flash-lite) и 1.20 (gpt-oss:20b) при
+# медиане 2.4 и 18.9 с. Порядок пула отсюда: быстрая и более точная первой.
+# Без отсидки Retry-After gpt-oss отдавал 4 батча из 9 — на 2000 max_tokens
+# рассуждение съедало ответ целиком; в кольце max_tokens не задаётся вовсе.
+#
+# Провайдер сторонний и моделей не хостит: это шлюз. Отсюда и место в цепочке —
+# не «дешёвая замена облаку», а то, что стоит между исчерпанной квотой и 1.7B
+# на домашней карте.
+LLM7_API_URL = os.environ.get("LLM7_API_URL",
+                              "https://api.llm7.io/v1/chat/completions")
+LLM7_MODELS = [m.strip() for m in os.environ.get(
+    "LLM7_MODELS", "gemini-3.1-flash-lite,gpt-oss:20b,deepseek-v3").split(",")
+    if m.strip()]
+# Анонимному тарифу ключ не нужен, но заголовок Authorization уходит всегда:
+# _openai_chat общий для всех провайдеров, а llm7 на любую строку отвечает так
+# же, как на её отсутствие (проверено 17.08.2026). Пустой LLM7_MODELS выключает
+# ступень целиком.
+LLM7_API_KEY = os.environ.get("LLM7_API_KEY", "anonymous")
+
 # Последний рубеж: своя модель на домашнем сервере (Ollama, OpenAI-совместимый
 # /v1/chat/completions по VPN). В кольцо round-robin НЕ входит намеренно —
 # она слабее любой облачной, и отдавать ей вызовы, пока у облака остались
@@ -402,15 +435,16 @@ def providers_exhausted() -> bool:
     на кругах, где не ответил никто."""
     tags = _ring_tags()
     if not tags:
-        # Ключей нет вовсе — но локальная модель ключа и не требует.
-        return not LOCAL_LLM_URL
+        # Ключей нет вовсе — но ни локальная модель, ни llm7 ключа и не требуют.
+        return not (LOCAL_LLM_URL or LLM7_MODELS)
     if _wait_spent >= RING_WAIT_BUDGET:
         # Бюджет ожидания сожжён. Сама по себе настроенная локальная модель это
         # не отменяет: путь к ней открывается ТОЛЬКО через all_cloud_exhausted,
         # то есть когда выбраны суточные лимиты. Круги, проваленные по другой
         # причине (упавшие модели, сеть), к ней не ведут — и тогда для
         # вызывающего кода это действительно "всё".
-        return not (LOCAL_LLM_URL and quota.all_cloud_exhausted(tags))
+        return not ((LOCAL_LLM_URL or LLM7_MODELS)
+                    and quota.all_cloud_exhausted(tags))
     return False
 
 
@@ -441,8 +475,13 @@ def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "
 
     tags = _ring_tags()
     if not tags:
+        # Ключей нет вовсе, но ступени без ключа остаются: сначала бесплатный
+        # шлюз, потом своя модель. Так проект собирается на чистой машине, где
+        # в .env ещё ничего не вписано.
+        out = _llm7_attempt(system_prompt, user_message, ref_url)
+        if out is not None:
+            return out
         if LOCAL_LLM_URL and not prefer_local:
-            # Ключей нет вовсе, но своя модель настроена — она и отработает.
             return _local_attempt(system_prompt, user_message, ref_url, schema)
         log.error("_call_openrouter_raw: не задан ни один ключ провайдера")
         return None
@@ -468,8 +507,11 @@ def _call_openrouter_raw(system_prompt: str, user_message: str, ref_url: str = "
         # не приводит: quota различает их по длине Retry-After, и на короткой
         # отсидке мы по-прежнему ждём облако — оно даёт лучшее качество.
         if quota.all_cloud_exhausted(tags):
-            log.warning("Все облачные исчерпаны (%s) — пробуем локальную модель",
+            log.warning("Все облачные исчерпаны (%s) — уходим на бесплатные",
                         quota.snapshot(tags))
+            out = _llm7_attempt(system_prompt, user_message, ref_url)
+            if out is not None:
+                return out
             out = _local_attempt(system_prompt, user_message, ref_url, schema)
             if out is not None:
                 return out
@@ -513,6 +555,19 @@ def _local_native_url() -> str:
     известное ограничение её OpenAI-совместимого слоя."""
     base = LOCAL_LLM_URL.split("/v1/")[0].rstrip("/")
     return base + "/api/chat"
+
+
+def _llm7_attempt(system_prompt: str, user_message: str,
+                  ref_url: str = "") -> str | None:
+    """Бесплатный шлюз llm7.io. Пул пробуется по очереди, как у Groq и Google.
+
+    Частотный лимит здесь жёстче облачного (10 запросов в минуту анонимно), и
+    ответ на него приходит с Retry-After: _openai_chat отдаёт его в
+    _note_retry_after, а кольцо само решает, ждать или идти дальше."""
+    if not LLM7_MODELS:
+        return None
+    return _try_pool(LLM7_MODELS, LLM7_API_URL, LLM7_API_KEY,
+                     system_prompt, user_message, "LLM7")
 
 
 def _local_attempt(system_prompt: str, user_message: str, ref_url: str = "",

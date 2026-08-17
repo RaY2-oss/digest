@@ -432,6 +432,8 @@ resources they need live outside either repo:
      work without billing).
    - `GROQ_API_KEY` (optional fallback) — https://console.groq.com/keys
    - `GOOGLE_API_KEY` (optional fallback) — https://aistudio.google.com/apikey
+   - no key at all is also a working configuration: the free llm7.io tier below
+     runs anonymously, and `LLM7_MODELS=` (empty) switches it off.
    - `TELEGRAM_BOT_TOKEN` — via `@BotFather`.
    - `TELEGRAM_CHAT_ID` — chat/channel to broadcast the weekly digest to.
    - `ALLOWED_TG_USER_IDS` (optional) — comma-separated user IDs allowed to
@@ -446,6 +448,62 @@ resources they need live outside either repo:
    out around 21:30 Moscow with the freshest week the database has. Also
    `cleanup_old_articles.py` daily and `telegram_bot_listener.py` as a
    long-running service.
+
+## Free tier when the daily quota is gone (`bench_providers.py`)
+
+The judge's quota is daily, and "few articles this week" usually means it ran
+out rather than that selection went wrong. Below the three keyed providers the
+ring now has one more step that needs no account at all: the **llm7.io**
+gateway, tried after `quota.all_cloud_exhausted()` says the cloud is spent and
+**before** the 1.7B model at home. It never enters the round-robin — while the
+cloud has quota left, its answers are better.
+
+Published anonymous limits (`docs.llm7.io/limits`): 1 request per second, 10
+per minute, 60 per hour, 500K tokens per 24h; an email at `dash.llm7.io` lifts
+that to 40/min and 1M tokens. A judge batch is ~24K characters and a day of
+collection is ~40 batches ≈ 360K tokens, so the anonymous tier covers the load
+with no headroom to spare and the email tier covers it comfortably.
+
+Measured 17.08.2026 on 90 basket articles, batches of 10, `Retry-After` obeyed
+the way the ring obeys it. The basket holds only articles the production judge
+**accepted**, so "accepted" here is strictness, not accuracy — the judge
+rejects about half of its own accepted articles on a re-read anyway:
+
+| model (keyless) | batches parsed | decided | region agrees | scale MAE | median |
+| --- | --- | --- | --- | --- | --- |
+| `gemini-3.1-flash-lite` | 9/9 | 90/90 | 0.97 | 0.92 | 2.4 s |
+| `gpt-oss:20b` | 9/9 | 90/90 | 0.98 | 1.20 | 18.9 s |
+
+Pool order follows that table. Without `Retry-After` handling `gpt-oss` parsed
+4 batches of 9 — two causes at once there, a 429 storm and a 2000-token cap its
+reasoning ate whole; the ring sets no `max_tokens`.
+
+**Rejected, and why — the useful half of the measurement:**
+
+- **OVHcloud AI Endpoints** `gpt-oss-120b` (documented as keyless, 2 rpm per
+  IP): rejected on speed, not on quality. Direct probes got `429 API rate limit
+  exceeded` every time; with `Retry-After` obeyed it does answer — 8/9 batches,
+  region 0.93, MAE 1.00 — but the median batch takes **122 s** (max 282 s,
+  1084 s for the same 90 articles `gemini-3.1-flash-lite` does in 30 s), and the
+  ninth batch was lost to a dropped connection. A fallback that costs half an
+  hour of wall clock per collection is not a fallback.
+- **Pollinations** (`gen.pollinations.ai`): now `401`, a key is required.
+- **mlvoca.com** (keyless Ollama proxy): `502`, gateway down.
+- **llm7 "pro" models** (`gpt-5.4-mini`, `claude-haiku-4-5`, `kimi-k2.6`, …):
+  `401` without a key. Only the "turbo" tier is anonymous, so the pool is
+  pinned by name — unlike OpenRouter, where the `:free` suffix is fetched live.
+- **`deepseek-v3`**: answers `200` and parses 0 batches of 3 — it does not hold
+  the object format. **`minimax-m2.7`**: `503`. **`mistral-Nemo`**: `429`
+  through that whole burst, which my own bursts also explain, so it is rejected
+  as unmeasured rather than as bad.
+
+`bench_providers.py` is the stand — it reuses the real judge prompt and
+`_parse_judge`, so a provider is measured on the work it would actually do:
+
+```
+venv/bin/python bench_providers.py --n 90 --retries 3       # all candidates
+venv/bin/python bench_providers.py --n 30 --only llm7       # one family
+```
 
 ## Notes
 

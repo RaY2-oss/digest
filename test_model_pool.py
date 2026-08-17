@@ -65,14 +65,23 @@ def test_silence_goes_to_pending_not_reject():
 
 
 def test_partial_answer_only_missing_goes_pending():
-    """Модель ответила не на все номера: недостающие в pending, прочие приняты."""
+    """Модель ответила не на все номера: недостающие в pending, прочие приняты.
+
+    Перестановка батча (_judge_call перемешивает статьи) здесь выключена: с ней
+    заглушка отвечает по номерам перемешанного порядка, и ожидаемый ответ
+    менялся бы от запуска к запуску. Что раскладка обратно верна, проверяет
+    следующий тест — он зовёт _parse_judge напрямую.
+    """
     real = dc._call_openrouter_raw
+    real_shuffle = dc.random.shuffle
     dc._call_openrouter_raw = lambda *a, **kw: '{"1": "CA2", "3": "NO"}'
+    dc.random.shuffle = lambda seq: None
     try:
         got = dc.judge_parallel(["a", "b", "c"])
         assert got == [("CA", 2), None, ("NO", None)], got
     finally:
         dc._call_openrouter_raw = real
+        dc.random.shuffle = real_shuffle
     print("judge_parallel: частичный ответ -> в pending только пропущенные — OK")
 
 
@@ -91,8 +100,10 @@ def test_verdict_without_a_digit_still_parses():
     """Цифру масштаба модель ставит не всегда, и это не повод терять статью:
     вердикт без цифры разбирается как раньше, масштаб — None (в ранжировании
     такая статья идёт по середине шкалы, см. _story_scale)."""
+    # "SC4" — законный вердикт с 17.08.2026: делений стало пять. До этого
+    # четвёрка была вне шкалы и статья уходила в pending.
     assert dc._parse_judge('{"1":"TR","2":"CA 3","3":"SC4"}', 3) == [
-        ("TR", None), ("CA", 3), None]
+        ("TR", None), ("CA", 3), ("SC", 4)]
     print("_parse_judge: вердикт без цифры не теряется — OK")
 
 
