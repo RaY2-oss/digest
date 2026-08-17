@@ -29,7 +29,7 @@ daily_collector.py — сбор статей за сутки (или за нед
     6. prefilter           — локальный классификатор-дистиллят отбрасывает
                              заведомый мусор без запроса к LLM (если обучен).
     7. judge_parallel()    — ОДИН LLM-вызов отдаёт релевантность, регион
-                             (TR/CA/SC/MIX) и масштаб события (1..3) одной
+                             (TR/CA/SC/MIX) и масштаб события (1..5) одной
                              строкой. Нет ответа -> pending, не отказ.
     8. flush_batch()       — пишет принятые статьи с готовым embedding в БД.
 """
@@ -40,6 +40,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 import io
 import json
 import logging
+import random
 import re
 import sqlite3
 import sys
@@ -195,37 +196,49 @@ _JUDGE_SYSTEM = (
     "  MIX - relevant, but the region is unclear.\n"
     "If Turkey is the main actor or location, choose TR.\n"
     "\n"
-    "Right after the region, append ONE digit — how much this event CHANGES the "
-    "country's science, education or youth system:\n"
-    "  3 - the country as a whole is different afterwards: a law or reform "
-    "adopted, a national programme launched or funded, an intergovernmental "
-    "agreement signed, a new university, national laboratory or research centre "
-    "opened, national statistics or a country-wide ranking published, a research "
-    "result of national or international significance;\n"
-    "  2 - a real change inside ONE institution or ONE sector, or an official "
-    "announcement that such a change is being prepared: a large grant, a new "
-    "faculty or department, a partnership with concrete money or obligations "
-    "behind it, an announced revision of an exam or a curriculum;\n"
-    "  1 - nothing in the system changes: a meeting, a visit, a forum, a "
-    "competition or its results, a corporate or charitable initiative, and any "
-    "seasonal or annual routine — enrolment, school uniforms, timetables, "
-    "scholarship lists, grant winners of a regular contest.\n"
-    "Be strict. In a batch of ten articles usually no more than two deserve 3, "
-    "and 1 is the most common answer. A ministry, a minister or a national "
-    "company as the ACTOR does not by itself make the event national, and "
-    "neither does the fact that it takes place across the whole country: ask "
-    "what would be DIFFERENT in the country if this news had not happened. "
-    "\"NO\" carries no digit.\n"
+    "Then rate how much the event CHANGES the country's science, education or "
+    "youth system, on a scale of 1 to 5. Compare the article to these anchors "
+    "instead of looking for keywords:\n"
+    "\n"
+    "  5 — the rules of the system are different afterwards.\n"
+    "      · a law on student amnesty is published in the Official Gazette and "
+    "takes effect;\n"
+    "      · a national curriculum reform is adopted for all schools.\n"
+    "  4 — a country-wide programme or body is created or funded, but the "
+    "existing rules stay.\n"
+    "      · a state AI-ecosystem call for proposals opens nationwide funding;\n"
+    "      · an intergovernmental education agreement is signed with concrete "
+    "obligations.\n"
+    "  3 — one institution or one sector really changes, with money or "
+    "obligations behind it.\n"
+    "      · a university opens a new laboratory with advanced equipment;\n"
+    "      · universities in one city shorten the academic year by a month.\n"
+    "  2 — a change is announced or prepared, or numbers of a regular process "
+    "are published.\n"
+    "      · state-order places for a group of specialities are announced;\n"
+    "      · a ministry says an exam will be revised next year.\n"
+    "  1 — nothing in the system changes.\n"
+    "      · a minister visits a province and is met at the airport;\n"
+    "      · a company presents a book, a forum is held, a contest names its "
+    "winners.\n"
+    "\n"
+    "A ministry, a minister or a national company as the ACTOR does not by "
+    "itself raise the level, and neither does the fact that something happens "
+    "across the whole country. Ask what would be DIFFERENT in the country if "
+    "this news had not happened.\n"
     "\n"
     "The article may be in any language — judge by content, not language."
 )
 
 _JUDGE_USER_TMPL = (
     "Below are {n} articles, each preceded by its number in square brackets.\n"
-    "Reply ONLY with a JSON object mapping every article number to its verdict, "
-    'no extra text — e.g. {{"1": "CA2", "2": "NO", "3": "TR3"}}.\n'
-    'Allowed values: "NO", or one of "TR", "CA", "SC", "MIX" immediately '
-    "followed by the scale digit 1, 2 or 3. "
+    "Reply ONLY with a JSON object, no extra text. For every article number "
+    'give an object with three fields IN THIS ORDER: '
+    '{{"w": "<one word or short phrase: what changed>", "r": "<region>", '
+    '"s": <scale 1-5>}}.\n'
+    'For a rejected article reply {{"w": "-", "r": "NO"}} with no "s".\n'
+    'Example: {{"1": {{"w": "law adopted", "r": "TR", "s": 5}}, '
+    '"2": {{"w": "-", "r": "NO"}}}}\n'
     "Every number from 1 to {n} must appear exactly once.\n\n"
     "{articles}"
 )
@@ -250,14 +263,35 @@ _VERDICTS = ("NO", "TR", "CA", "SC", "MIX")
 # ИНАЧЕ, если бы этой новости не было», явный список рутины в пункте 1 и
 # указание доли (не больше двух троек на десяток). На той же выборке стало
 # 8/11/12 при 1/2/3 — и переехало именно то, что должно было.
-_VERDICT_RE = re.compile(r"(NO|TR|CA|SC|MIX)\s*([1-3])?$")
+#
+# 17.08.2026 делений стало пять, признаки заменены якорями, ответ разнесён на
+# поля {"w","r","s"}. Причина: три деления не лечились долей. Верхний разряд
+# держал 30% принятых статей (322 из 1056), у 101 сюжета из 364 масштаб был
+# одинаковый и максимальный, то есть фактор с весом 0.40 у трети отбора не
+# различал ничего. Замер (bench_judge.py, вся корзина 1172 статьи, обе
+# редакции одной и той же локальной моделью — иначе сравнивались бы судьи, а
+# не рубрики): доля верхнего разряда 0.611 -> 0.180, распределение по пяти
+# делениям 16/125/209/204/122, самосогласованность (тот же батч в другом
+# порядке) по средней ошибке 0.186 -> 0.145. Отдельный прогон v2a показал, за
+# что платим: ровное распределение дают ЯКОРЯ, а не лишние деления — та же
+# пятибалльная шкала списком признаков оставляет наверху 0.270.
+# Чего замер НЕ показал: что отбор стал лучше. На срезе квоты меняются 4-5
+# сюжетов из 21, отрыв на границе вырос в TR и SC и упал в CA. Без ручной
+# разметки (bench/label_task.tsv) сказать «релевантнее» нельзя — принято по
+# распределению и самосогласованности, а не по nDCG.
+_VERDICT_RE = re.compile(r"(NO|TR|CA|SC|MIX)\s*([1-5])?$")
 
 
 def _parse_judge(content, n):
     """-> список пар (регион, масштаб) длины n; None на позиции = решения нет.
 
-    Масштаб — 1..3 или None, если модель цифру не поставила (масштаб тогда
-    считается средним, см. sunday_processor_mmr._story_scale)."""
+    Масштаб — 1..5 или None, если модель цифру не поставила (масштаб тогда
+    считается средним, см. sunday_processor_mmr._story_scale).
+
+    Разбирается и старая форма ответа одной строкой ("TR3"): модель иногда
+    отвечает по памяти о прежнем формате, и терять из-за этого целый батч
+    дороже, чем держать три строки разбора.
+    """
     m = re.search(r"\{.*\}", content or "", re.DOTALL)
     if not m:
         return None
@@ -270,6 +304,21 @@ def _parse_judge(content, n):
     out = []
     for i in range(1, n + 1):
         v = data.get(str(i), data.get(i))
+        if isinstance(v, dict):
+            region = str(v.get("r", "")).strip().upper()
+            # Цифра приезжает и строкой ("s": "4") — это та же оценка, терять
+            # её из-за кавычек значит отправить статью в середину шкалы.
+            try:
+                s = int(float(v.get("s")))
+            except (TypeError, ValueError):
+                s = None
+            if region not in _VERDICTS:
+                out.append(None)
+            elif region == "NO" or s is None:
+                out.append((region, None))
+            else:
+                out.append((region, min(max(s, 1), 5)))
+            continue
         m = _VERDICT_RE.match(str(v).strip().upper()) if v is not None else None
         out.append((m.group(1), int(m.group(2)) if m.group(2) else None)
                    if m else None)
@@ -277,16 +326,37 @@ def _parse_judge(content, n):
 
 
 def _judge_call(texts):
+    """Порядок статей в батче перемешивается, потом вердикты раскладываются
+    обратно.
+
+    Позиция в батче двигает ответ сама по себе: те же 120 статей, прогнанные
+    трижды с разными перестановками (bench_judge, локальная модель), в начале
+    батча получают в среднем 3.68 балла, в конце — 3.05, разница 0.63 ± 0.17,
+    3.7 сигмы. Убрать этот сдвиг нечем — он свойство модели, — но статьи
+    приходят сгруппированными по запросу и источнику, и без перемешивания
+    место в батче достаётся не случайно: один и тот же источник систематически
+    оказывается в хвосте и систематически недооценивается. После перестановки
+    это шум, а не смещение. Замер сделан на локальной модели: у облачного
+    судьи величина сдвига своя, направление — то же.
+    """
+    order = list(range(len(texts)))
+    random.shuffle(order)
     block = "".join(
-        f"[{i}] {t.replace(chr(10), ' ')[:JUDGE_TEXT_CHARS]}\n\n"
-        for i, t in enumerate(texts, 1))
+        f"[{i}] {texts[k].replace(chr(10), ' ')[:JUDGE_TEXT_CHARS]}\n\n"
+        for i, k in enumerate(order, 1))
     raw = _call_openrouter_raw(
         _JUDGE_SYSTEM,
         _JUDGE_USER_TMPL.format(n=len(texts), articles=block),
         ref_url="judge")
     if raw is None:
         return None
-    return _parse_judge(raw, len(texts))
+    shuffled = _parse_judge(raw, len(texts))
+    if shuffled is None:
+        return None
+    out = [None] * len(texts)
+    for i, k in enumerate(order):
+        out[k] = shuffled[i]
+    return out
 
 
 def judge_parallel(texts):

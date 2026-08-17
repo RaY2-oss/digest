@@ -100,11 +100,47 @@ to repurpose this for a different beat.
      names is downloaded — prominence is derived from our own corpus, so it is
      multilingual and self-updating. The factor stays off by itself while no
      actor clears the threshold.
-   - **scale** — how far the event reaches, graded by the LLM judge that
-     already reads the article (`"TR3"` — bucket plus one digit, no extra
-     call): one institution, a city, a country, beyond it. Averaged over the
-     story's versions rather than maxed, so a single outlet calling its own
-     story national cannot carry it alone.
+   - **scale** — how much the event changes the country's system, graded by the
+     LLM judge that already reads the article (one call returns bucket and
+     digit together, `{"w":…,"r":"TR","s":5}`). Averaged over the story's
+     versions rather than maxed, so a single outlet calling its own story
+     national cannot carry it alone.
+
+     Five levels with anchor examples since 17.08.2026, three with feature
+     lists before that. Three did not survive its own weight: the top grade
+     held 30% of accepted articles (322 of 1056) and 101 of TR's 364 stories
+     shared it, so the heaviest factor (0.40) told a third of the selection
+     apart from nothing. Measured with `bench_judge.py` over the whole 1172-
+     article basket, **both rubrics run through the same local model** — the
+     first attempt compared the cloud judge's v1 grades against the local
+     model's v2 grades and measured the judges, not the rubrics. Top-grade
+     share 0.611 → 0.180, distribution over five levels 16/125/209/204/122,
+     self-agreement on the same batch reshuffled (mean scale-normalized gap)
+     0.186 → 0.145. A third arm settles what to pay maintenance for: the same
+     five levels written as feature lists instead of anchors leaves 0.270 at
+     the top, so the flattening comes from the **anchors**, and it is the
+     anchors that have to be revisited when the agenda moves.
+
+     What the measurement does *not* show is that the selection got better. At
+     the quota cut 4–5 stories of 21 change hands, the margin at the cut grows
+     in TR (0.094 → 0.143 of the bucket's spread) and in SC (0.013 → 0.043) and
+     collapses in CA (0.062 → 0.003). Without hand labels
+     (`bench/label_task.tsv`) there is no nDCG to settle it; the rubric was
+     accepted on distribution and self-agreement alone, and that is the whole
+     of the evidence. Rejected in the same measurement: the tournament (top-30
+     k-wise comparisons with Bradley–Terry) the audit held in reserve — it was
+     to be run only if the histogram stayed skewed, and it did not.
+
+     The batch is also shuffled before it goes to the judge, and that is a
+     separate measurement, not a courtesy. Position inside the batch moves the
+     answer by itself: the same 120 articles run three times under different
+     permutations average 3.68 at positions 1–3 and 3.05 at positions 8–10,
+     a difference of 0.63 ± 0.17 — 3.7 sigma, against a factor weight of 0.40.
+     The bias cannot be removed, it belongs to the model; but articles arrive
+     grouped by query and by source, so without shuffling one source keeps
+     landing in the tail and keeps being under-graded. Shuffling turns a bias
+     into noise. Measured on the local model — the cloud judge's number is its
+     own, the direction is not.
    - **topic** — the local classifier's probability (see `prefilter.py` below),
      reused here as a continuous "is this our subject at all" measure. Without
      it the thin CA/SC buckets floated chess politics, party-building reports

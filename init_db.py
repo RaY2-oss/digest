@@ -17,7 +17,7 @@ init_db.py — одноразовая инициализация базы дан
     text         TEXT                 — полный текст статьи (trafilatura);
     embedding    BLOB                 — numpy float32 вектор (384 dim) в bytes;
     entities     TEXT                 — персоны/организации из GKG (entities.py);
-    scale        INTEGER              — 1..3, национальный масштаб события от
+    scale        INTEGER              — 1..5, национальный масштаб события от
                                         судьи-LLM (NULL = не оценивался).
 """
 
@@ -51,7 +51,7 @@ CREATE INDEX IF NOT EXISTS idx_articles_fetch_date ON articles(fetch_date);
 MIGRATIONS = [
     ("language", "TEXT"),
     ("entities", "TEXT"),   # субъекты из GKG V1Persons/V1Organizations, см. entities.py
-    ("scale", "INTEGER"),   # 1..3 — национальный масштаб от судьи, см. daily_collector
+    ("scale", "INTEGER"),   # 1..5 — национальный масштаб от судьи, см. daily_collector
 ]
 
 

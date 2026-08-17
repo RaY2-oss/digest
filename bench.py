@@ -388,7 +388,7 @@ def _fmt(res):
     L.append("веса: " + " ".join(
         "%s=%.2f" % (k[len("IMPORTANCE_W_"):].lower(), getattr(config, k))
         for k in sorted(dir(config)) if k.startswith("IMPORTANCE_W_")))
-    L.append("scale_top_share = %.3f   (доля троек среди оценённых статей)"
+    L.append("scale_top_share = %.3f   (доля верхнего разряда среди оценённых)"
              % res["scale_top_share"])
     L.append("mean_importance = %.4f  без квот %.4f  цена квоты %.4f"
              % (res["mean_importance"], res["mean_importance_noquota"],

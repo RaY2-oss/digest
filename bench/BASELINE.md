@@ -1,6 +1,6 @@
 # Базовая линия релевантности
 
-Снято 16.08.2026 командой `python bench.py run`.
+Снято 17.08.2026 командой `python bench.py run`.
 Набор заморожен в `bench/basket.npz` и `bench/issues.npz`;
 что в нём есть и чего нет — в шапке `bench.py`.
 

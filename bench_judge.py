@@ -136,14 +136,27 @@ _SCALE_V2A = (
 )
 
 
+_SCALE_HEAD = ("Right after the region, append ONE digit",   # рубрика до 17.08
+               "Then rate how much the event CHANGES")       # и после
+
+
 def prompts(variant):
-    """-> (system, user_template, число делений шкалы)."""
+    """-> (system, user_template, число делений шкалы).
+
+    "v1" — не «старая редакция», а БОЕВОЙ промпт, какой он сейчас. С 17.08.2026
+    боевой и есть v2, так что прогон v1 против v2 с этого дня сравнивает
+    редакцию саму с собой; числа прежнего сравнения лежат в bench/judge_runs*.json
+    и bench/scale_v1_local.json, повторить его нечем — текст v1 не хранится.
+    """
     import daily_collector as D
     if variant == "v1":
-        return D._JUDGE_SYSTEM, D._JUDGE_USER_TMPL, 3
+        return (D._JUDGE_SYSTEM, D._JUDGE_USER_TMPL,
+                5 if _SCALE_HEAD[1] in D._JUDGE_SYSTEM else 3)
     # Тело промпта — то же самое: T1/T2 и список отказов замером не оспорены,
     # спор идёт только о шкале. Меняем ровно её, иначе непонятно, что подействовало.
-    head = D._JUDGE_SYSTEM.split("Right after the region, append ONE digit")[0]
+    head = D._JUDGE_SYSTEM
+    for marker in _SCALE_HEAD:
+        head = head.split(marker)[0]
     tail = "The article may be in any language — judge by content, not language."
     scale = {"v2": _SCALE_V2, "v2a": _SCALE_V2A}[variant]
     return head + scale + "\n" + tail, _USER_V2, 5
@@ -167,7 +180,7 @@ def parse(content, n, variant):
     out = []
     for i in range(1, n + 1):
         v = data.get(str(i), data.get(i))
-        if variant != "v1" and isinstance(v, dict):
+        if isinstance(v, dict):   # боевая форма ответа с 17.08.2026
             r = str(v.get("r", "")).strip().upper()
             s = v.get("s")
             if r not in ("NO", "TR", "CA", "SC", "MIX"):
