@@ -288,7 +288,7 @@ Ranking changes are compared against a frozen set, not against memory.
 ```
 venv/bin/python bench.py build   # freeze the set (rewrites bench/)
 venv/bin/python bench.py run     # metrics -> bench/BASELINE.md
-venv/bin/python bench.py labels  # 198 hard cases for the owner to grade
+venv/bin/python bench.py labels  # 198 hard cases, on demand — declined, see below
 ```
 
 The set is **one basket, six issues, no 26-week replay**. `cleanup_old_articles.py`
@@ -340,9 +340,26 @@ Georgia's national free-textbook programme. Rejected — kept at hard 7/7/6.
 The floor variant silently shortens the issue to 16 items, which is a different
 decision from "raise relevance" and belongs to the owner, not to a weight.
 
-`ndcg@7` stays empty until `bench/labels.tsv` exists. It is deliberately not
-faked: every automatic stand-in for relevance here is built out of the same
-factors being judged and would only measure itself.
+`ndcg@7` stays empty. It needs `bench/labels.tsv` — the owner's own reading of
+a few hundred borderline articles — and the owner has decided (17.08.2026) not
+to do that, which is a legitimate answer and not a task left pending. Nothing
+here waits for it: `bench.py labels` still writes the task file on demand if
+that ever changes.
+
+What it costs is worth stating once, so that no later reader mistakes the
+stand for more than it is. Every number this stand produces is *indirect*:
+grade distribution, self-agreement, the margin at the quota cut, how many
+stories change hands. They tell whether a change did something and whether it
+did it consistently. None of them says the issue got more relevant. The
+rubric, the novelty factor, the rejected quota, the deleted MMR branch and the
+kept retelling prompt all rest on that kind of evidence, and a decision that
+looks good on all of it can still be wrong in the direction that matters.
+
+`ndcg@7` is deliberately not faked meanwhile: every automatic stand-in for
+relevance here is built out of the same factors being judged and would only
+measure itself. The one honest source of labels left is the issue itself — if
+an item ever gets struck out before sending, that strike is a label, and it is
+worth writing down where the stand can find it.
 
 ### Language labels are cosmetic
 
